@@ -334,32 +334,60 @@ def main():
         scan_button = st.button(button_label, type="primary", width="stretch")
 
     # ---------------------------------------------------------
-    # ROUTE 1: HISTORICAL SCAN
+    # ROUTE 1: HISTORICAL SCAN (MULTI-PIPE THREADING)
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
-        st.info("🔌 Initializing Secure TradingView Connection... (Takes ~7 seconds once per day)")
+        st.info("🔌 Initializing Secure 5-Pipe TradingView Connection... (Takes ~7 seconds)")
         tv_pool = get_tv_pool()
-        tv_instance = tv_pool[0] # Use the first pipe for historical
 
         strategy = OpenDriveStrategy()
         strategy.config.EMA_FAST, strategy.config.EMA_SLOW = ema_fast, ema_slow
         strategy.config.DEFAULT_SL_PCT, strategy.config.DEFAULT_TARGET_RR = sl_pct, target_rr
 
-        progress_container = st.container()
-        with progress_container:
-            st.subheader("⏳ Scraping Historical Data...")
+        progress_container = st.empty()
+        with progress_container.container():
+            st.subheader("⏳ Scraping Deep Historical Data...")
             progress_bar = st.progress(0)
             status_text = st.empty()
 
         all_signals = []
         total = len(stock_list)
+        completed = 0
 
-        for i, symbol in enumerate(stock_list):
-            progress_bar.progress((i + 1) / total)
-            status_text.text(f"Scanning: {symbol} ({i+1}/{total})")
-            signals = strategy.scan_stock(tv_instance, symbol, scan_date, progress_bar, status_text, i, total)
-            all_signals.extend(signals)
-            time.sleep(random.uniform(0.1, 0.3))
+        # 🚨 THE HISTORICAL WORKER FUNCTION
+        def process_historical_stock(task_data):
+            idx, sym, target_date = task_data
+            tv_inst = tv_pool[idx % 5] # Distribute across the 5 pipes
+            
+            # Anti-ban staggering
+            time.sleep(random.uniform(0.1, 0.4)) 
+            
+            # is_live=False triggers the massive 100-day payload (7,500 candles per stock)
+            d5 = strategy.get_stealth_historical_candles(tv_inst, sym, 5, is_live=False, days_back=100)
+            d15 = strategy.get_stealth_historical_candles(tv_inst, sym, 15, is_live=False, days_back=100)
+            
+            if not d5.empty and not d15.empty:
+                return strategy._evaluate_signals(sym, target_date, d5, d15)
+            return []
+
+        # 🚨 5 WORKERS, 5 PIPES FOR MASSIVE DATA EXTRACTION
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
+            futures = {executor.submit(process_historical_stock, task): task for task in tasks}
+            
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                
+                # UI Throttle: Update screen every 5 stocks to prevent rendering lag
+                if completed % 5 == 0 or completed == total:
+                    progress_bar.progress(completed / total)
+                    status_text.text(f"⚡ Multi-Pipe Historical Scraping... ({completed}/{total})")
+                
+                try:
+                    res = future.result()
+                    if res: all_signals.extend(res)
+                except Exception:
+                    pass
 
         progress_container.empty()
         display_results(all_signals, scan_date)
