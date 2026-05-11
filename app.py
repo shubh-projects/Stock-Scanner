@@ -362,7 +362,7 @@ def main():
         display_results(all_signals, scan_date)
 
     # ---------------------------------------------------------
-    # ROUTE 2: REAL-TIME SEQUENTIAL SPRINT (WITH LIVE UI)
+    # ROUTE 2: REAL-TIME SEQUENTIAL SPRINT (THROTTLED UI + PURE DATA)
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan (TV Polling)":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 LIVE TRADINGVIEW CONNECTION ACTIVE</span></div>', unsafe_allow_html=True)
@@ -376,7 +376,7 @@ def main():
         while True:
             all_signals = []
             
-            # 🚨 Force IST Date and Time
+            # Force IST Date and Time
             live_datetime = datetime.now(IST)
             current_time = live_datetime.time()
             
@@ -384,18 +384,23 @@ def main():
                 (current_time >= datetime.strptime("09:15", "%H:%M").time() and 
                  current_time <= datetime.strptime("15:30", "%H:%M").time()))
 
-            # 🚨 INJECT PROGRESS BAR FOR LIVE MODE
+            # UI Progress Bar Setup
             progress_container = st.empty()
             with progress_container.container():
                 live_progress = st.progress(0)
                 live_status = st.empty()
 
             total = len(stock_list)
+            
             for i, symbol in enumerate(stock_list):
-                # Update UI so you know it isn't frozen
-                live_progress.progress((i + 1) / total)
-                live_status.text(f"⚡ Live Polling: {symbol} ({i+1}/{total})")
+                # 🚨 THE UI THROTTLE 🚨
+                # Only handshake with the Streamlit server every 10 stocks (or the very last stock).
+                # This eliminates ~3.5 minutes of cloud rendering lag.
+                if i % 10 == 0 or i == total - 1:
+                    live_progress.progress((i + 1) / total)
+                    live_status.text(f"⚡ Live Polling: {symbol} ({i+1}/{total}) - Pure Data Integrity Mode")
 
+                # Pulling BOTH 5m and 15m to guarantee mathematical perfection
                 d5 = strategy.get_stealth_historical_candles(symbol, 5, is_live=True)
                 d15 = strategy.get_stealth_historical_candles(symbol, 15, is_live=True)
                 
@@ -403,9 +408,10 @@ def main():
                     signals = strategy._evaluate_signals(symbol, live_datetime, d5, d15)
                     if signals: all_signals.extend(signals)
                 
+                # The Clear-Pipe Sleep ensures TradingView doesn't ban the connection
                 time.sleep(random.uniform(0.1, 0.2)) 
                 
-            # Clear the progress bar once the loop finishes
+            # Erase the progress bar once the loop finishes so the screen is clean
             progress_container.empty()
 
             with live_container.container():
