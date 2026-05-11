@@ -362,7 +362,7 @@ def main():
         display_results(all_signals, scan_date)
 
     # ---------------------------------------------------------
-    # ROUTE 2: REAL-TIME SEQUENTIAL SPRINT (PURE DATA INTEGRITY)
+    # ROUTE 2: REAL-TIME SEQUENTIAL SPRINT (WITH LIVE UI)
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan (TV Polling)":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 LIVE TRADINGVIEW CONNECTION ACTIVE</span></div>', unsafe_allow_html=True)
@@ -384,7 +384,18 @@ def main():
                 (current_time >= datetime.strptime("09:15", "%H:%M").time() and 
                  current_time <= datetime.strptime("15:30", "%H:%M").time()))
 
-            for symbol in stock_list:
+            # 🚨 INJECT PROGRESS BAR FOR LIVE MODE
+            progress_container = st.empty()
+            with progress_container.container():
+                live_progress = st.progress(0)
+                live_status = st.empty()
+
+            total = len(stock_list)
+            for i, symbol in enumerate(stock_list):
+                # Update UI so you know it isn't frozen
+                live_progress.progress((i + 1) / total)
+                live_status.text(f"⚡ Live Polling: {symbol} ({i+1}/{total})")
+
                 d5 = strategy.get_stealth_historical_candles(symbol, 5, is_live=True)
                 d15 = strategy.get_stealth_historical_candles(symbol, 15, is_live=True)
                 
@@ -392,12 +403,13 @@ def main():
                     signals = strategy._evaluate_signals(symbol, live_datetime, d5, d15)
                     if signals: all_signals.extend(signals)
                 
-                # The Clear-Pipe Sleep
                 time.sleep(random.uniform(0.1, 0.2)) 
                 
+            # Clear the progress bar once the loop finishes
+            progress_container.empty()
+
             with live_container.container():
                 market_status = "🟢 Market Open" if is_market_open else "🔴 Market Closed"
-                # 🚨 Force IST Text output
                 st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | Status: {market_status} (Auto-refreshing...)")
                 display_results(all_signals, live_datetime)
                 
