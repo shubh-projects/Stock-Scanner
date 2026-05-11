@@ -6,13 +6,14 @@ import time
 import random
 import warnings
 import logging
+import concurrent.futures
 from tvDatafeed import TvDatafeed, Interval
 
 # 🚨 Mute Streamlit and tvDatafeed warnings/connection drops
 warnings.filterwarnings('ignore')
 logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 
-# 🚨 Global IST Timezone (Prevents Cloud Server UTC Bugs)
+# 🚨 Global IST Timezone
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
@@ -64,18 +65,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize TradingView Guest Connection
+# 🚨 THE NEW ARCHITECTURE: MULTI-PIPE CONNECTION POOL
 @st.cache_resource
-def get_tv_connection():
-    return TvDatafeed()
+def get_tv_pool():
+    """Spins up 5 completely separate WebSocket connections to prevent traffic jams."""
+    return [TvDatafeed() for _ in range(5)]
 
-tv = get_tv_connection()
+tv_pool = get_tv_pool()
 
 # ================================================================================
 # SECURITY GATEWAY
 # ================================================================================
 def check_password():
-    """Returns `True` if the user has entered the correct password."""
     def password_entered():
         if st.session_state["password"] == st.secrets["app_password"]:
             st.session_state["password_correct"] = True
@@ -110,21 +111,19 @@ class OpenDriveStrategy:
     def __init__(self):
         self.config = Config()
 
-    def get_stealth_historical_candles(self, symbol, resolution_minutes, is_live=False, days_back=100):
-        """Pulls chart data using Micro-Payloads for live speed."""
+    def get_stealth_historical_candles(self, tv_instance, symbol, resolution_minutes, is_live=False, days_back=100):
+        """Uses a specific WebSocket instance from the pool to pull data safely."""
         try:
             if resolution_minutes == 5:
                 tv_interval = Interval.in_5_minute
-                # 🚨 500 candles guarantees EMA math matches Pine Script exactly
                 bars_to_pull = 500 if is_live else (days_back * 75)
             else:
                 tv_interval = Interval.in_15_minute
-                # 🚨 500 candles guarantees EMA math matches Pine Script exactly
                 bars_to_pull = 500 if is_live else (days_back * 25)
 
             formatted_symbol = symbol.replace('.NS', '')
             
-            df = tv.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
+            df = tv_instance.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
             
             if df is None or df.empty:
                 return pd.DataFrame()
@@ -212,8 +211,9 @@ class OpenDriveStrategy:
 
     def scan_stock(self, symbol, scan_date, progress_bar=None, status_text=None, current_idx=0, total=1):
         try:
-            df_5min = self.get_stealth_historical_candles(symbol, 5, is_live=False, days_back=100)
-            df_15min = self.get_stealth_historical_candles(symbol, 15, is_live=False, days_back=100)
+            # Historical scan uses Pipe 0
+            df_5min = self.get_stealth_historical_candles(tv_pool[0], symbol, 5, is_live=False, days_back=100)
+            df_15min = self.get_stealth_historical_candles(tv_pool[0], symbol, 15, is_live=False, days_back=100)
             if df_5min.empty or df_15min.empty: return []
             return self._evaluate_signals(symbol, scan_date, df_5min, df_15min)
         except Exception:
@@ -281,7 +281,6 @@ def display_results(all_signals, scan_date):
 # MAIN STREAMLIT APP
 # ================================================================================
 def main():
-    # 🚨 SECURITY GATEWAY
     if not check_password():
         st.stop()
 
@@ -294,7 +293,6 @@ def main():
         st.markdown("---")
         st.header("⚙️ Settings")
         
-        # 🚨 Forced IST Date
         scan_date = st.date_input("Select Date (For Historical Only)", value=datetime.now(IST) - timedelta(days=1), max_value=datetime.now(IST))
         st.markdown("---")
         
@@ -362,7 +360,7 @@ def main():
         display_results(all_signals, scan_date)
 
     # ---------------------------------------------------------
-    # ROUTE 2: REAL-TIME SEQUENTIAL SPRINT (THROTTLED UI + PURE DATA)
+    # ROUTE 2: REAL-TIME ENGINE (MULTI-PIPE THREADING)
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan (TV Polling)":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 LIVE TRADINGVIEW CONNECTION ACTIVE</span></div>', unsafe_allow_html=True)
@@ -373,10 +371,23 @@ def main():
         
         live_container = st.empty()
         
+        # 🚨 THE WORKER FUNCTION
+        def process_live_stock(task_data):
+            idx, sym, target_time = task_data
+            tv_inst = tv_pool[idx % 5] # Distribute smoothly across the 5 WebSocket pipes
+            
+            # Micro-sleep offsets threads so they don't hit the TV server on the exact same millisecond
+            time.sleep(random.uniform(0.1, 0.4)) 
+            
+            d5 = strategy.get_stealth_historical_candles(tv_inst, sym, 5, is_live=True)
+            d15 = strategy.get_stealth_historical_candles(tv_inst, sym, 15, is_live=True)
+            
+            if not d5.empty and not d15.empty:
+                return strategy._evaluate_signals(sym, target_time, d5, d15)
+            return []
+
         while True:
             all_signals = []
-            
-            # Force IST Date and Time
             live_datetime = datetime.now(IST)
             current_time = live_datetime.time()
             
@@ -384,34 +395,33 @@ def main():
                 (current_time >= datetime.strptime("09:15", "%H:%M").time() and 
                  current_time <= datetime.strptime("15:30", "%H:%M").time()))
 
-            # UI Progress Bar Setup
             progress_container = st.empty()
             with progress_container.container():
                 live_progress = st.progress(0)
                 live_status = st.empty()
 
             total = len(stock_list)
-            
-            for i, symbol in enumerate(stock_list):
-                # 🚨 THE UI THROTTLE 🚨
-                # Only handshake with the Streamlit server every 10 stocks (or the very last stock).
-                # This eliminates ~3.5 minutes of cloud rendering lag.
-                if i % 10 == 0 or i == total - 1:
-                    live_progress.progress((i + 1) / total)
-                    live_status.text(f"⚡ Live Polling: {symbol} ({i+1}/{total}) - Pure Data Integrity Mode")
+            completed = 0
 
-                # Pulling BOTH 5m and 15m to guarantee mathematical perfection
-                d5 = strategy.get_stealth_historical_candles(symbol, 5, is_live=True)
-                d15 = strategy.get_stealth_historical_candles(symbol, 15, is_live=True)
+            # 🚨 5 WORKERS, 5 PIPES
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
+                futures = {executor.submit(process_live_stock, task): task for task in tasks}
                 
-                if not d5.empty and not d15.empty:
-                    signals = strategy._evaluate_signals(symbol, live_datetime, d5, d15)
-                    if signals: all_signals.extend(signals)
+                for future in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    
+                    # UI Throttle: Update screen every 5 stocks to prevent rendering lag
+                    if completed % 5 == 0 or completed == total:
+                        live_progress.progress(completed / total)
+                        live_status.text(f"⚡ Multi-Pipe Engine Processing... ({completed}/{total})")
+                    
+                    try:
+                        res = future.result()
+                        if res: all_signals.extend(res)
+                    except Exception:
+                        pass
                 
-                # The Clear-Pipe Sleep ensures TradingView doesn't ban the connection
-                time.sleep(random.uniform(0.1, 0.2)) 
-                
-            # Erase the progress bar once the loop finishes so the screen is clean
             progress_container.empty()
 
             with live_container.container():
