@@ -1,17 +1,19 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import random
 import warnings
 import logging
-import concurrent.futures
 from tvDatafeed import TvDatafeed, Interval
 
 # 🚨 Mute Streamlit and tvDatafeed warnings/connection drops
 warnings.filterwarnings('ignore')
 logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
+
+# 🚨 Global IST Timezone (Prevents Cloud Server UTC Bugs)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
 # PAGE UI & CSS
@@ -109,14 +111,16 @@ class OpenDriveStrategy:
         self.config = Config()
 
     def get_stealth_historical_candles(self, symbol, resolution_minutes, is_live=False, days_back=100):
-        """Pulls chart data using Micro-Payloads for live speed (300 candles max)."""
+        """Pulls chart data using Micro-Payloads for live speed."""
         try:
             if resolution_minutes == 5:
                 tv_interval = Interval.in_5_minute
-                bars_to_pull = 300 if is_live else (days_back * 75)
+                # 🚨 500 candles guarantees EMA math matches Pine Script exactly
+                bars_to_pull = 500 if is_live else (days_back * 75)
             else:
                 tv_interval = Interval.in_15_minute
-                bars_to_pull = 300 if is_live else (days_back * 25)
+                # 🚨 500 candles guarantees EMA math matches Pine Script exactly
+                bars_to_pull = 500 if is_live else (days_back * 25)
 
             formatted_symbol = symbol.replace('.NS', '')
             
@@ -282,14 +286,16 @@ def main():
         st.stop()
 
     st.markdown('<div class="main-header">📈 Open Drive Strategy Scanner</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Filter 90+ NSE stocks using your Open=Low/High + 15min Pattern + EMA Strategy</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Filter 110 NSE stocks using your Open=Low/High + 15min Pattern + EMA Strategy</div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("⚙️ Data Source")
         scan_mode = st.radio("Select Engine Mode:", ["Historical Scan", "Real-Time Scan (TV Polling)"])
         st.markdown("---")
         st.header("⚙️ Settings")
-        scan_date = st.date_input("Select Date (For Historical Only)", value=datetime.now() - timedelta(days=1), max_value=datetime.now())
+        
+        # 🚨 Forced IST Date
+        scan_date = st.date_input("Select Date (For Historical Only)", value=datetime.now(IST) - timedelta(days=1), max_value=datetime.now(IST))
         st.markdown("---")
         
         st.subheader("📋 Stock List")
@@ -356,7 +362,7 @@ def main():
         display_results(all_signals, scan_date)
 
     # ---------------------------------------------------------
-    # ROUTE 2: REAL-TIME MULTITHREADED ENGINE
+    # ROUTE 2: REAL-TIME SEQUENTIAL SPRINT (PURE DATA INTEGRITY)
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan (TV Polling)":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 LIVE TRADINGVIEW CONNECTION ACTIVE</span></div>', unsafe_allow_html=True)
@@ -366,41 +372,39 @@ def main():
         strategy.config.DEFAULT_SL_PCT, strategy.config.DEFAULT_TARGET_RR = sl_pct, target_rr
         
         live_container = st.empty()
-
-        def process_single_stock(sym, target_time):
-            time.sleep(random.uniform(0.05, 0.15)) # The Anti-Ban Shield
-            d5 = strategy.get_stealth_historical_candles(sym, 5, is_live=True)
-            d15 = strategy.get_stealth_historical_candles(sym, 15, is_live=True)
-            if not d5.empty and not d15.empty:
-                return strategy._evaluate_signals(sym, target_time, d5, d15)
-            return []
         
         while True:
             all_signals = []
-            live_datetime = datetime.now()
+            
+            # 🚨 Force IST Date and Time
+            live_datetime = datetime.now(IST)
             current_time = live_datetime.time()
+            
             is_market_open = (live_datetime.weekday() < 5 and 
                 (current_time >= datetime.strptime("09:15", "%H:%M").time() and 
                  current_time <= datetime.strptime("15:30", "%H:%M").time()))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(process_single_stock, symbol, live_datetime): symbol for symbol in stock_list}
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        signals = future.result()
-                        if signals: all_signals.extend(signals)
-                    except Exception:
-                        pass
+            for symbol in stock_list:
+                d5 = strategy.get_stealth_historical_candles(symbol, 5, is_live=True)
+                d15 = strategy.get_stealth_historical_candles(symbol, 15, is_live=True)
+                
+                if not d5.empty and not d15.empty:
+                    signals = strategy._evaluate_signals(symbol, live_datetime, d5, d15)
+                    if signals: all_signals.extend(signals)
+                
+                # The Clear-Pipe Sleep
+                time.sleep(random.uniform(0.1, 0.2)) 
                 
             with live_container.container():
                 market_status = "🟢 Market Open" if is_market_open else "🔴 Market Closed"
-                st.write(f"⏱️ Last Updated: {datetime.now().strftime('%H:%M:%S IST')} | Status: {market_status} (Auto-refreshing...)")
+                # 🚨 Force IST Text output
+                st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | Status: {market_status} (Auto-refreshing...)")
                 display_results(all_signals, live_datetime)
                 
             if not is_market_open:
                 time.sleep(60) 
             else:
-                time.sleep(5)
+                time.sleep(2)
 
     elif not stock_list:
         st.info("Please add stocks to scan from the sidebar.")
