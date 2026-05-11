@@ -65,13 +65,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 🚨 THE NEW ARCHITECTURE: MULTI-PIPE CONNECTION POOL
+# 🚨 THE FIX: STAGGERED CONNECTION POOL
 @st.cache_resource
 def get_tv_pool():
-    """Spins up 5 completely separate WebSocket connections to prevent traffic jams."""
-    return [TvDatafeed() for _ in range(5)]
-
-tv_pool = get_tv_pool()
+    """Spins up 5 WebSocket connections slowly to prevent Cloudflare blocks."""
+    pool = []
+    for i in range(5):
+        pool.append(TvDatafeed())
+        time.sleep(1.5) # The magic stagger that bypasses the firewall
+    return pool
 
 # ================================================================================
 # SECURITY GATEWAY
@@ -112,7 +114,6 @@ class OpenDriveStrategy:
         self.config = Config()
 
     def get_stealth_historical_candles(self, tv_instance, symbol, resolution_minutes, is_live=False, days_back=100):
-        """Uses a specific WebSocket instance from the pool to pull data safely."""
         try:
             if resolution_minutes == 5:
                 tv_interval = Interval.in_5_minute
@@ -209,11 +210,11 @@ class OpenDriveStrategy:
             return 'sell', {'open': o, 'high': h, 'low': l, 'close': c, 'time': df_5min.index[0].strftime('%H:%M')}
         return None, {}
 
-    def scan_stock(self, symbol, scan_date, progress_bar=None, status_text=None, current_idx=0, total=1):
+    # 🚨 LAZY LOADING APPLIED HERE
+    def scan_stock(self, tv_instance, symbol, scan_date, progress_bar=None, status_text=None, current_idx=0, total=1):
         try:
-            # Historical scan uses Pipe 0
-            df_5min = self.get_stealth_historical_candles(tv_pool[0], symbol, 5, is_live=False, days_back=100)
-            df_15min = self.get_stealth_historical_candles(tv_pool[0], symbol, 15, is_live=False, days_back=100)
+            df_5min = self.get_stealth_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
+            df_15min = self.get_stealth_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
             if df_5min.empty or df_15min.empty: return []
             return self._evaluate_signals(symbol, scan_date, df_5min, df_15min)
         except Exception:
@@ -336,6 +337,10 @@ def main():
     # ROUTE 1: HISTORICAL SCAN
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
+        st.info("🔌 Initializing Secure TradingView Connection... (Takes ~7 seconds once per day)")
+        tv_pool = get_tv_pool()
+        tv_instance = tv_pool[0] # Use the first pipe for historical
+
         strategy = OpenDriveStrategy()
         strategy.config.EMA_FAST, strategy.config.EMA_SLOW = ema_fast, ema_slow
         strategy.config.DEFAULT_SL_PCT, strategy.config.DEFAULT_TARGET_RR = sl_pct, target_rr
@@ -352,7 +357,7 @@ def main():
         for i, symbol in enumerate(stock_list):
             progress_bar.progress((i + 1) / total)
             status_text.text(f"Scanning: {symbol} ({i+1}/{total})")
-            signals = strategy.scan_stock(symbol, scan_date, progress_bar, status_text, i, total)
+            signals = strategy.scan_stock(tv_instance, symbol, scan_date, progress_bar, status_text, i, total)
             all_signals.extend(signals)
             time.sleep(random.uniform(0.1, 0.3))
 
@@ -363,20 +368,22 @@ def main():
     # ROUTE 2: REAL-TIME ENGINE (MULTI-PIPE THREADING)
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan (TV Polling)":
-        st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 LIVE TRADINGVIEW CONNECTION ACTIVE</span></div>', unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 INITIALIZING 5-PIPE CONNECTION POOL... (Takes ~7 Sec)</span></div>', unsafe_allow_html=True)
         
+        # 🚨 LAZY LOAD: Connects only after you click Launch
+        tv_pool = get_tv_pool()
+        st.markdown('<div style="text-align:center;"><span class="live-badge" style="background-color: #28a745;">🟢 LIVE POLLING ACTIVE</span></div>', unsafe_allow_html=True)
+
         strategy = OpenDriveStrategy()
         strategy.config.EMA_FAST, strategy.config.EMA_SLOW = ema_fast, ema_slow
         strategy.config.DEFAULT_SL_PCT, strategy.config.DEFAULT_TARGET_RR = sl_pct, target_rr
         
         live_container = st.empty()
         
-        # 🚨 THE WORKER FUNCTION
         def process_live_stock(task_data):
             idx, sym, target_time = task_data
-            tv_inst = tv_pool[idx % 5] # Distribute smoothly across the 5 WebSocket pipes
+            tv_inst = tv_pool[idx % 5] 
             
-            # Micro-sleep offsets threads so they don't hit the TV server on the exact same millisecond
             time.sleep(random.uniform(0.1, 0.4)) 
             
             d5 = strategy.get_stealth_historical_candles(tv_inst, sym, 5, is_live=True)
@@ -403,7 +410,6 @@ def main():
             total = len(stock_list)
             completed = 0
 
-            # 🚨 5 WORKERS, 5 PIPES
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
                 futures = {executor.submit(process_live_stock, task): task for task in tasks}
@@ -411,7 +417,6 @@ def main():
                 for future in concurrent.futures.as_completed(futures):
                     completed += 1
                     
-                    # UI Throttle: Update screen every 5 stocks to prevent rendering lag
                     if completed % 5 == 0 or completed == total:
                         live_progress.progress(completed / total)
                         live_status.text(f"⚡ Multi-Pipe Engine Processing... ({completed}/{total})")
