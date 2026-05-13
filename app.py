@@ -133,7 +133,8 @@ class OpenDriveStrategy:
             df.index = pd.to_datetime(df.index)
             
             if df.index.tz is None:
-                df.index = df.index.tz_localize('Asia/Kolkata')
+                # 🚨 THE FIX: Acknowledge the data is UTC first, THEN convert to IST
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
             else:
                 df.index = df.index.tz_convert('Asia/Kolkata')
                 
