@@ -78,10 +78,7 @@ class Config:
     FIB_LEVEL_1 = 0.50
     FIB_LEVEL_2 = 0.618
     MIN_IMPULSE_PCT = 0.5
-    FIXED_IMPULSE_AMT = 5.0
-    USE_FIXED_IMPULSE = False
     DEFAULT_TARGET_RR = 2.0
-    OHL_TOLERANCE = 0.01
 
 class OpenDriveFibStrategy:
     def __init__(self):
@@ -132,7 +129,7 @@ class OpenDriveFibStrategy:
 
         return is_uptrend, is_downtrend
 
-    def scan_stock(self, tv_instance, symbol, scan_date, tolerance=0.01):
+    def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
         """
         EXACT Pine Script logic mirror with [1] bar gap enforcement:
         - Impulse must complete on bar N
@@ -161,11 +158,29 @@ class OpenDriveFibStrategy:
             first5_high = first_5m['high']
             first5_low = first_5m['low']
 
+            # ADAPTIVE TOLERANCE based on price (like Pine Script percentage)
+            price = first5_open if first5_open > 0 else 1.0
+            tolerance = price * (tolerance_pct / 100)
+
             # Check setup
             first5_is_buy_setup = abs(first5_open - first5_low) <= tolerance
             first5_is_sell_setup = abs(first5_open - first5_high) <= tolerance
 
+            # DEBUG LOGGING
+            sym_clean = symbol.replace('.NS', '')
+            debug_mode = sym_clean in ['SAIL', 'DABUR', 'TCS']
+            if debug_mode:
+                print(f"\n{'='*60}")
+                print(f"DEBUG {sym_clean} on {target_date}")
+                print(f"  First 5m: O={first5_open:.2f} H={first5_high:.2f} L={first5_low:.2f}")
+                print(f"  abs(O-L)={abs(first5_open-first5_low):.4f} | abs(O-H)={abs(first5_open-first5_high):.4f}")
+                print(f"  Tolerance%: {tolerance_pct}% | Tolerance₹: {tolerance:.4f}")
+                print(f"  Buy setup: {first5_is_buy_setup} | Sell setup: {first5_is_sell_setup}")
+
             if not first5_is_buy_setup and not first5_is_sell_setup:
+                if debug_mode:
+                    print(f"  ❌ NO SETUP - returning None")
+                    print(f"{'='*60}")
                 return None
 
             # Calculate EMAs on 15m
@@ -178,9 +193,9 @@ class OpenDriveFibStrategy:
             buy_fib_50 = None
             buy_fib_618 = None
             buy_impulse_done = False
-            buy_impulse_bar = -1  # Bar index where impulse completed
+            buy_impulse_bar = -1
             buy_retraced = False
-            buy_retrace_bar = -1  # Bar index where retrace completed
+            buy_retrace_bar = -1
             buy_signal_fired = False
 
             sell_swing_low = None
@@ -199,18 +214,22 @@ class OpenDriveFibStrategy:
 
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
                 if i == 0:
-                    continue  # Skip first candle
+                    continue
 
                 # === SETUP INVALIDATION ===
                 if first5_is_buy_setup and not buy_setup_invalid:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
+                        if debug_mode:
+                            print(f"  ❌ BUY INVALIDATED at bar {i} (low={row['low']:.2f} < first5_low={first5_low:.2f})")
 
                 if first5_is_sell_setup and not sell_setup_invalid:
                     if row['high'] > first5_high:
                         sell_setup_invalid = True
+                        if debug_mode:
+                            print(f"  ❌ SELL INVALIDATED at bar {i} (high={row['high']:.2f} > first5_high={first5_high:.2f})")
 
-                # === BUY IMPULSE (can complete on any bar) ===
+                # === BUY IMPULSE ===
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if buy_swing_high is None:
                         buy_swing_high = row['high']
@@ -223,6 +242,8 @@ class OpenDriveFibStrategy:
                         buy_impulse_bar = i
                         buy_fib_50 = buy_swing_high - self.config.FIB_LEVEL_1 * (buy_swing_high - first5_low)
                         buy_fib_618 = buy_swing_high - self.config.FIB_LEVEL_2 * (buy_swing_high - first5_low)
+                        if debug_mode:
+                            print(f"  📈 BUY IMPULSE at bar {i} | swing_high={buy_swing_high:.2f} | fib50={buy_fib_50:.2f}")
 
                 # === SELL IMPULSE ===
                 if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
@@ -237,28 +258,29 @@ class OpenDriveFibStrategy:
                         sell_impulse_bar = i
                         sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
                         sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
+                        if debug_mode:
+                            print(f"  📉 SELL IMPULSE at bar {i} | swing_low={sell_swing_low:.2f} | fib50={sell_fib_50:.2f}")
 
-                # === BUY RETRACEMENT (MUST be on bar AFTER impulse bar) ===
-                # Pine: if buyImpulseDone[1] and not buyRetraced
-                # This means: impulse was done on PREVIOUS bar (i-1), now check current bar (i)
+                # === BUY RETRACEMENT (bar AFTER impulse) ===
                 if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
                     if row['low'] <= buy_fib_50:
                         buy_retraced = True
                         buy_retrace_bar = i
+                        if debug_mode:
+                            print(f"  🔄 BUY RETRACED at bar {i} | low={row['low']:.2f} <= fib50={buy_fib_50:.2f}")
 
-                # === SELL RETRACEMENT (MUST be on bar AFTER impulse bar) ===
+                # === SELL RETRACEMENT (bar AFTER impulse) ===
                 if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
                     if row['high'] >= sell_fib_50:
                         sell_retraced = True
                         sell_retrace_bar = i
+                        if debug_mode:
+                            print(f"  🔄 SELL RETRACED at bar {i} | high={row['high']:.2f} >= fib50={sell_fib_50:.2f}")
 
-                # === BUY RECOVERY (MUST be on bar AFTER retrace bar) ===
-                # Pine: buyRecovering = buyRetraced and isGreen and close > buyRetracementZone
-                # buyRetraced was set on previous bar, now check current bar
+                # === BUY RECOVERY (bar AFTER retrace) ===
                 if buy_retraced and not buy_signal_fired and i > buy_retrace_bar and not buy_setup_invalid:
                     is_green = row['close'] > row['open']
                     if is_green and row['close'] > buy_fib_50:
-                        # Check EMA conditions
                         is_uptrend, _ = self.check_trend(df_15min_today.iloc[:i+1])
                         price_above_emas = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
 
@@ -268,7 +290,7 @@ class OpenDriveFibStrategy:
                             target = entry + (entry - sl) * self.config.DEFAULT_TARGET_RR
 
                             signal = {
-                                'symbol': symbol.replace('.NS', ''),
+                                'symbol': sym_clean,
                                 'date': target_date.strftime('%Y-%m-%d'),
                                 'direction': 'BUY',
                                 'setup_time': df_5min_today.index[0].strftime('%H:%M'),
@@ -285,13 +307,14 @@ class OpenDriveFibStrategy:
                                 'trend': 'UP'
                             }
                             buy_signal_fired = True
+                            if debug_mode:
+                                print(f"  ✅ BUY SIGNAL at bar {i} | entry={entry:.2f}")
                             break
 
-                # === SELL RESUMPTION (MUST be on bar AFTER retrace bar) ===
+                # === SELL RESUMPTION (bar AFTER retrace) ===
                 if sell_retraced and not sell_signal_fired and i > sell_retrace_bar and not sell_setup_invalid:
                     is_red = row['close'] < row['open']
                     if is_red and row['close'] < sell_fib_50:
-                        # Check EMA conditions
                         _, is_downtrend = self.check_trend(df_15min_today.iloc[:i+1])
                         price_below_emas = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
 
@@ -301,7 +324,7 @@ class OpenDriveFibStrategy:
                             target = entry - (sl - entry) * self.config.DEFAULT_TARGET_RR
 
                             signal = {
-                                'symbol': symbol.replace('.NS', ''),
+                                'symbol': sym_clean,
                                 'date': target_date.strftime('%Y-%m-%d'),
                                 'direction': 'SELL',
                                 'setup_time': df_5min_today.index[0].strftime('%H:%M'),
@@ -318,11 +341,37 @@ class OpenDriveFibStrategy:
                                 'trend': 'DOWN'
                             }
                             sell_signal_fired = True
+                            if debug_mode:
+                                print(f"  ✅ SELL SIGNAL at bar {i} | entry={entry:.2f}")
                             break
+
+            if debug_mode:
+                if signal:
+                    print(f"  🎯 FINAL: {signal['direction']} signal @ {signal['entry_price']}")
+                else:
+                    print(f"  ❌ FINAL: No signal generated")
+                    if buy_setup_invalid:
+                        print(f"     Reason: Buy setup was invalidated")
+                    elif sell_setup_invalid:
+                        print(f"     Reason: Sell setup was invalidated")
+                    elif first5_is_buy_setup and not buy_impulse_done:
+                        print(f"     Reason: No buy impulse (swing_high={buy_swing_high})")
+                    elif first5_is_sell_setup and not sell_impulse_done:
+                        print(f"     Reason: No sell impulse (swing_low={sell_swing_low})")
+                    elif buy_impulse_done and not buy_retraced:
+                        print(f"     Reason: No buy retracement (fib50={buy_fib_50})")
+                    elif sell_impulse_done and not sell_retraced:
+                        print(f"     Reason: No sell retracement (fib50={sell_fib_50})")
+                    elif buy_retraced and not buy_signal_fired:
+                        print(f"     Reason: No buy recovery after retrace")
+                    elif sell_retraced and not sell_signal_fired:
+                        print(f"     Reason: No sell resumption after retrace")
+                print(f"{'='*60}")
 
             return signal
 
         except Exception as e:
+            print(f"ERROR in {symbol}: {str(e)}")
             return None
 
 # ================================================================================
@@ -421,7 +470,7 @@ def main():
         fib_618 = st.number_input("Fib Level 2 (0.618)", value=0.618, min_value=0.10, max_value=0.90, step=0.001)
         impulse_pct = st.number_input("Min Impulse %", value=0.5, min_value=0.1, max_value=5.0, step=0.1)
         rr = st.number_input("Risk:Reward Ratio", value=2.0, min_value=1.0, max_value=5.0, step=0.5)
-        tolerance = st.number_input("Open=High/Low Tolerance (₹)", value=0.01, min_value=0.01, max_value=1.0, step=0.01)
+        tolerance_pct = st.number_input("Open=High/Low Tolerance (%)", value=0.01, min_value=0.001, max_value=1.0, step=0.001, format="%.3f")
 
         st.markdown("---")
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
@@ -440,7 +489,6 @@ def main():
         strategy.config.FIB_LEVEL_2 = fib_618
         strategy.config.MIN_IMPULSE_PCT = impulse_pct
         strategy.config.DEFAULT_TARGET_RR = rr
-        strategy.config.OHL_TOLERANCE = tolerance
 
         progress_container = st.empty()
         with progress_container.container():
@@ -456,7 +504,7 @@ def main():
             idx, sym, target_date = task_data
             tv_inst = tv_pool[idx % 5]
             time.sleep(random.uniform(0.1, 0.4))
-            return strategy.scan_stock(tv_inst, sym, target_date, tolerance)
+            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
@@ -493,7 +541,6 @@ def main():
         strategy.config.FIB_LEVEL_2 = fib_618
         strategy.config.MIN_IMPULSE_PCT = impulse_pct
         strategy.config.DEFAULT_TARGET_RR = rr
-        strategy.config.OHL_TOLERANCE = tolerance
 
         live_container = st.empty()
 
@@ -501,7 +548,7 @@ def main():
             idx, sym, target_time = task_data
             tv_inst = tv_pool[idx % 5]
             time.sleep(random.uniform(0.1, 0.4))
-            return strategy.scan_stock(tv_inst, sym, target_time, tolerance)
+            return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
 
         while True:
             all_signals = []
