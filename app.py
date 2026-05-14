@@ -35,7 +35,6 @@ st.markdown("""
     .signal-card { padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid; }
     .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
     .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
-    .debug-log { font-family: 'Courier New', monospace; font-size: 0.82rem; line-height: 1.35; white-space: pre-wrap; background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -131,26 +130,24 @@ class OpenDriveFibStrategy:
         return is_uptrend, is_downtrend
 
     def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
-        debug_lines = []
-        def log(msg):
-            debug_lines.append(msg)
-
+        """
+        EXACT Pine Script logic mirror with [1] bar gap enforcement.
+        EMAs calculated on FULL history before date filtering (proper warmup).
+        """
         try:
             df_5min = self.get_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
             df_15min = self.get_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
 
             if df_5min.empty or df_15min.empty:
-                return None, "\n".join(debug_lines)
+                return None
 
             target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
 
-            # =================================================================
-            # CRITICAL: Calculate EMAs on FULL history first for proper warmup
-            # =================================================================
+            # Calculate EMAs on FULL history first for proper warmup
             df_15min['ema20'] = self.calculate_ema(df_15min, self.config.EMA_FAST)
             df_15min['ema50'] = self.calculate_ema(df_15min, self.config.EMA_SLOW)
 
-            # Now filter to target date AND market hours (9:15 onwards)
+            # Filter to target date AND market hours (9:15 onwards)
             df_5min_today = df_5min[
                 (df_5min.index.date == target_date) & 
                 (df_5min.index.time >= pd.Timestamp('09:15').time())
@@ -161,8 +158,7 @@ class OpenDriveFibStrategy:
             ].copy()
 
             if df_5min_today.empty or df_15min_today.empty:
-                log(f"[{symbol}] No market-hours data for {target_date}")
-                return None, "\n".join(debug_lines)
+                return None
 
             # Get first 5m candle (strictly 9:15-9:20)
             first_5m = df_5min_today.iloc[0]
@@ -179,21 +175,9 @@ class OpenDriveFibStrategy:
             first5_is_sell_setup = abs(first5_open - first5_high) <= tolerance
 
             sym_clean = symbol.replace('.NS', '')
-            debug_mode = sym_clean in ['SAIL', 'DABUR', 'TCS']
-
-            if debug_mode:
-                log(f"{'='*60}")
-                log(f"DEBUG {sym_clean} on {target_date}")
-                log(f"  First 5m: O={first5_open:.2f} H={first5_high:.2f} L={first5_low:.2f}")
-                log(f"  abs(O-L)={abs(first5_open-first5_low):.4f} | abs(O-H)={abs(first5_open-first5_high):.4f}")
-                log(f"  Tolerance%: {tolerance_pct}% | Tolerance₹: {tolerance:.4f}")
-                log(f"  Buy setup: {first5_is_buy_setup} | Sell setup: {first5_is_sell_setup}")
 
             if not first5_is_buy_setup and not first5_is_sell_setup:
-                if debug_mode:
-                    log(f"  ❌ NO SETUP")
-                    log(f"{'='*60}")
-                return None, "\n".join(debug_lines)
+                return None
 
             # === STATE VARIABLES ===
             buy_swing_high = None
@@ -219,23 +203,17 @@ class OpenDriveFibStrategy:
 
             signal = None
 
-            # =================================================================
             # MAIN LOOP — DO NOT SKIP i=0
-            # =================================================================
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
 
                 # === SETUP INVALIDATION — ONLY BEFORE IMPULSE COMPLETES ===
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
-                        if debug_mode:
-                            log(f"  ❌ BUY INVALIDATED at bar {i} {idx.strftime('%H:%M')} (low={row['low']:.2f} < first5_low={first5_low:.2f})")
 
                 if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
                     if row['high'] > first5_high:
                         sell_setup_invalid = True
-                        if debug_mode:
-                            log(f"  ❌ SELL INVALIDATED at bar {i} {idx.strftime('%H:%M')} (high={row['high']:.2f} > first5_high={first5_high:.2f})")
 
                 # === BUY IMPULSE ===
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
@@ -250,8 +228,6 @@ class OpenDriveFibStrategy:
                         buy_impulse_bar = i
                         buy_fib_50 = buy_swing_high - self.config.FIB_LEVEL_1 * (buy_swing_high - first5_low)
                         buy_fib_618 = buy_swing_high - self.config.FIB_LEVEL_2 * (buy_swing_high - first5_low)
-                        if debug_mode:
-                            log(f"  📈 BUY IMPULSE DONE at bar {i} {idx.strftime('%H:%M')} | swing_high={buy_swing_high:.2f} | fib50={buy_fib_50:.2f}")
 
                 # === SELL IMPULSE ===
                 if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
@@ -266,34 +242,22 @@ class OpenDriveFibStrategy:
                         sell_impulse_bar = i
                         sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
                         sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
-                        if debug_mode:
-                            log(f"  📉 SELL IMPULSE DONE at bar {i} {idx.strftime('%H:%M')} | swing_low={sell_swing_low:.2f} | fib50={sell_fib_50:.2f}")
 
                 # === BUY RETRACEMENT (bar AFTER impulse) ===
                 if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
                     if row['low'] <= buy_fib_50:
                         buy_retraced = True
                         buy_retrace_bar = i
-                        if debug_mode:
-                            log(f"  🔄 BUY RETRACED at bar {i} {idx.strftime('%H:%M')} | low={row['low']:.2f} <= fib50={buy_fib_50:.2f}")
 
                 # === SELL RETRACEMENT (bar AFTER impulse) ===
                 if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
                     if row['high'] >= sell_fib_50:
                         sell_retraced = True
                         sell_retrace_bar = i
-                        if debug_mode:
-                            log(f"  🔄 SELL RETRACED at bar {i} {idx.strftime('%H:%M')} | high={row['high']:.2f} >= fib50={sell_fib_50:.2f}")
 
                 # === BUY RECOVERY (bar AFTER retrace) ===
                 if buy_retraced and not buy_signal_fired and i > buy_retrace_bar:
                     is_green = row['close'] > row['open']
-                    
-                    if debug_mode:
-                        is_uptrend_dbg, _ = self.check_trend(df_15min_today.iloc[:i+1])
-                        price_above_dbg = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
-                        log(f"  [BUY SIG CHECK bar {i} {idx.strftime('%H:%M')}] green={is_green} close>{buy_fib_50:.2f}={row['close'] > buy_fib_50} aboveEMAs={price_above_dbg} uptrend={is_uptrend_dbg}")
-
                     if is_green and row['close'] > buy_fib_50:
                         is_uptrend, _ = self.check_trend(df_15min_today.iloc[:i+1])
                         price_above_emas = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
@@ -321,19 +285,11 @@ class OpenDriveFibStrategy:
                                 'trend': 'UP'
                             }
                             buy_signal_fired = True
-                            if debug_mode:
-                                log(f"  ✅ BUY SIGNAL FIRED at bar {i} {idx.strftime('%H:%M')} | entry={entry:.2f}")
                             break
 
                 # === SELL RESUMPTION (bar AFTER retrace) ===
                 if sell_retraced and not sell_signal_fired and i > sell_retrace_bar:
                     is_red = row['close'] < row['open']
-                    
-                    if debug_mode:
-                        _, is_downtrend_dbg = self.check_trend(df_15min_today.iloc[:i+1])
-                        price_below_dbg = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
-                        log(f"  [SELL SIG CHECK bar {i} {idx.strftime('%H:%M')}] red={is_red} close<{sell_fib_50:.2f}={row['close'] < sell_fib_50} belowEMAs={price_below_dbg} downtrend={is_downtrend_dbg}")
-
                     if is_red and row['close'] < sell_fib_50:
                         _, is_downtrend = self.check_trend(df_15min_today.iloc[:i+1])
                         price_below_emas = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
@@ -361,47 +317,12 @@ class OpenDriveFibStrategy:
                                 'trend': 'DOWN'
                             }
                             sell_signal_fired = True
-                            if debug_mode:
-                                log(f"  ✅ SELL SIGNAL FIRED at bar {i} {idx.strftime('%H:%M')} | entry={entry:.2f}")
                             break
 
-            # =================================================================
-            # FINAL SUMMARY
-            # =================================================================
-            if debug_mode:
-                if signal:
-                    log(f"  🎯 FINAL: {signal['direction']} signal @ {signal['entry_price']}")
-                else:
-                    log(f"  ❌ FINAL: No signal generated")
-                    reasons = []
-                    if first5_is_buy_setup and buy_setup_invalid:
-                        reasons.append("Buy setup invalidated early")
-                    if first5_is_sell_setup and sell_setup_invalid:
-                        reasons.append("Sell setup invalidated early")
-                    if first5_is_buy_setup and not buy_impulse_done:
-                        reasons.append(f"No buy impulse (swing_high={buy_swing_high}, need>={first5_high * (1 + self.config.MIN_IMPULSE_PCT / 100):.2f})")
-                    if first5_is_sell_setup and not sell_impulse_done:
-                        reasons.append(f"No sell impulse (swing_low={sell_swing_low}, need<<={first5_low * (1 - self.config.MIN_IMPULSE_PCT / 100):.2f})")
-                    if buy_impulse_done and not buy_retraced:
-                        reasons.append(f"No buy retracement (fib50={buy_fib_50:.2f})")
-                    if sell_impulse_done and not sell_retraced:
-                        reasons.append(f"No sell retracement (fib50={sell_fib_50:.2f})")
-                    if buy_retraced and not buy_signal_fired:
-                        reasons.append("No buy recovery (green+close>fib50+EMAs+trend)")
-                    if sell_retraced and not sell_signal_fired:
-                        reasons.append("No sell resumption (red+close<<fib50+EMAs+trend)")
-                    if not reasons:
-                        reasons.append("Unknown")
-                    log(f"     Reasons: {' | '.join(reasons)}")
-                log(f"{'='*60}")
-
-            return signal, "\n".join(debug_lines)
+            return signal
 
         except Exception as e:
-            log(f"ERROR in {symbol}: {str(e)}")
-            import traceback
-            log(traceback.format_exc())
-            return None, "\n".join(debug_lines)
+            return None
 
 # ================================================================================
 # DISPLAY RESULTS
@@ -523,7 +444,6 @@ def main():
             status_text = st.empty()
 
         all_signals = []
-        all_debug_logs = []
         total = len(stock_list)
         completed = 0
 
@@ -531,8 +451,7 @@ def main():
             idx, sym, target_date = task_data
             tv_inst = tv_pool[idx % 5]
             time.sleep(random.uniform(0.1, 0.4))
-            signal, debug_log = strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
-            return signal, debug_log
+            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
@@ -545,9 +464,7 @@ def main():
                     status_text.text(f"⚡ Scanning... ({completed}/{total})")
 
                 try:
-                    res, debug_log = future.result()
-                    if debug_log:
-                        all_debug_logs.append(debug_log)
+                    res = future.result()
                     if res:
                         all_signals.append(res)
                 except Exception:
@@ -555,11 +472,6 @@ def main():
 
         progress_container.empty()
         display_results(all_signals, scan_date)
-
-        # Show debug console
-        if all_debug_logs:
-            with st.expander("🐛 Debug Console (SAIL / DABUR / TCS)", expanded=True):
-                st.markdown('<div class="debug-log">' + "\n\n".join(all_debug_logs) + '</div>', unsafe_allow_html=True)
 
     # ---------------------------------------------------------
     # REAL-TIME SCAN
@@ -578,7 +490,6 @@ def main():
         strategy.config.DEFAULT_TARGET_RR = rr
 
         live_container = st.empty()
-        debug_container = st.empty()
 
         def process_live(task_data):
             idx, sym, target_time = task_data
@@ -588,7 +499,6 @@ def main():
 
         while True:
             all_signals = []
-            all_debug_logs = []
             live_datetime = datetime.now(IST)
             current_time = live_datetime.time()
 
@@ -615,9 +525,7 @@ def main():
                         live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
 
                     try:
-                        res, debug_log = future.result()
-                        if debug_log:
-                            all_debug_logs.append(debug_log)
+                        res = future.result()
                         if res:
                             all_signals.append(res)
                     except Exception:
@@ -629,11 +537,6 @@ def main():
                 market_status = "🟢 Market Open" if is_market_open else "🔴 Market Closed"
                 st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | {market_status}")
                 display_results(all_signals, live_datetime)
-
-            with debug_container.container():
-                if all_debug_logs:
-                    with st.expander("🐛 Debug Console (SAIL / DABUR / TCS)"):
-                        st.markdown('<div class="debug-log">' + "\n\n".join(all_debug_logs) + '</div>', unsafe_allow_html=True)
 
             time.sleep(60 if not is_market_open else 5)
 
