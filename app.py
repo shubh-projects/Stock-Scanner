@@ -131,13 +131,6 @@ class OpenDriveFibStrategy:
         return is_uptrend, is_downtrend
 
         def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
-        """
-        EXACT Pine Script logic mirror with [1] bar gap enforcement.
-        CRITICAL FIXES:
-        1. EMAs calculated on FULL history before date filtering (proper warmup).
-        2. Process i=0 (first 15m bar) — Pine Script does NOT skip it.
-        3. Setup invalidation only applies BEFORE impulse completes.
-        """
         debug_lines = []
         def log(msg):
             debug_lines.append(msg)
