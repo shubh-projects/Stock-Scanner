@@ -130,13 +130,13 @@ class OpenDriveFibStrategy:
 
         return is_uptrend, is_downtrend
 
-    def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
+        def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
         """
         EXACT Pine Script logic mirror with [1] bar gap enforcement.
         CRITICAL FIXES:
-        1. Process i=0 (first 15m bar) — Pine Script does NOT skip it.
-           The first 15m bar's high/low are essential for impulse tracking.
-        2. Setup invalidation only applies BEFORE impulse completes.
+        1. EMAs calculated on FULL history before date filtering (proper warmup).
+        2. Process i=0 (first 15m bar) — Pine Script does NOT skip it.
+        3. Setup invalidation only applies BEFORE impulse completes.
         """
         debug_lines = []
         def log(msg):
@@ -151,7 +151,13 @@ class OpenDriveFibStrategy:
 
             target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
 
-            # Filter to target date AND market hours (9:15 onwards)
+            # =================================================================
+            # CRITICAL: Calculate EMAs on FULL history first for proper warmup
+            # =================================================================
+            df_15min['ema20'] = self.calculate_ema(df_15min, self.config.EMA_FAST)
+            df_15min['ema50'] = self.calculate_ema(df_15min, self.config.EMA_SLOW)
+
+            # Now filter to target date AND market hours (9:15 onwards)
             df_5min_today = df_5min[
                 (df_5min.index.date == target_date) & 
                 (df_5min.index.time >= pd.Timestamp('09:15').time())
@@ -196,11 +202,6 @@ class OpenDriveFibStrategy:
                     log(f"{'='*60}")
                 return None, "\n".join(debug_lines)
 
-            # Calculate EMAs on 15m
-            df_15min_today = df_15min_today.copy()
-            df_15min_today['ema20'] = self.calculate_ema(df_15min_today, self.config.EMA_FAST)
-            df_15min_today['ema50'] = self.calculate_ema(df_15min_today, self.config.EMA_SLOW)
-
             # === STATE VARIABLES ===
             buy_swing_high = None
             buy_fib_50 = None
@@ -226,8 +227,7 @@ class OpenDriveFibStrategy:
             signal = None
 
             # =================================================================
-            # MAIN LOOP — DO NOT SKIP i=0. Pine Script processes the first 15m bar
-            # for invalidation, impulse, and everything else.
+            # MAIN LOOP — DO NOT SKIP i=0
             # =================================================================
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
 
