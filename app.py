@@ -70,7 +70,7 @@ def check_password():
         return True
 
 # ================================================================================
-# STRATEGY LOGIC — EXACT PINE SCRIPT MIRROR
+# STRATEGY LOGIC — EXACT PINE SCRIPT MIRROR WITH [1] BAR GAP
 # ================================================================================
 class Config:
     EMA_FAST = 20
@@ -134,16 +134,10 @@ class OpenDriveFibStrategy:
 
     def scan_stock(self, tv_instance, symbol, scan_date, tolerance=0.01):
         """
-        EXACT Pine Script logic mirror:
-        1. Get first 5m candle
-        2. Check Open=Low or Open=High
-        3. Track impulse (price must move beyond threshold)
-        4. Check invalidation (break of first 5m low/high)
-        5. Calculate Fib levels at impulse completion
-        6. Wait for retracement to Fib 0.5
-        7. Wait for recovery candle (green for buy, red for sell)
-        8. Check EMA conditions
-        9. Signal fires once per day only
+        EXACT Pine Script logic mirror with [1] bar gap enforcement:
+        - Impulse must complete on bar N
+        - Retracement can only start checking on bar N+1
+        - Recovery can only start checking on bar N+2 (after retrace completed)
         """
         try:
             df_5min = self.get_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
@@ -161,7 +155,7 @@ class OpenDriveFibStrategy:
             if df_5min_today.empty or df_15min_today.empty:
                 return None
 
-            # Get first 5m candle (should be 9:15)
+            # Get first 5m candle
             first_5m = df_5min_today.iloc[0]
             first5_open = first_5m['open']
             first5_high = first_5m['high']
@@ -179,22 +173,25 @@ class OpenDriveFibStrategy:
             df_15min_today['ema20'] = self.calculate_ema(df_15min_today, self.config.EMA_FAST)
             df_15min_today['ema50'] = self.calculate_ema(df_15min_today, self.config.EMA_SLOW)
 
-            # === PHASE TRACKING (exact Pine Script mirror) ===
+            # === STATE VARIABLES (exact Pine Script var mirror) ===
             buy_swing_high = None
             buy_fib_50 = None
             buy_fib_618 = None
             buy_impulse_done = False
+            buy_impulse_bar = -1  # Bar index where impulse completed
             buy_retraced = False
+            buy_retrace_bar = -1  # Bar index where retrace completed
             buy_signal_fired = False
 
             sell_swing_low = None
             sell_fib_50 = None
             sell_fib_618 = None
             sell_impulse_done = False
+            sell_impulse_bar = -1
             sell_retraced = False
+            sell_retrace_bar = -1
             sell_signal_fired = False
 
-            # Setup invalidation tracking
             buy_setup_invalid = False
             sell_setup_invalid = False
 
@@ -202,9 +199,9 @@ class OpenDriveFibStrategy:
 
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
                 if i == 0:
-                    continue  # Skip first candle (it's the 9:15 or first 15m candle)
+                    continue  # Skip first candle
 
-                # === SETUP INVALIDATION (same as Pine Script) ===
+                # === SETUP INVALIDATION ===
                 if first5_is_buy_setup and not buy_setup_invalid:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
@@ -213,7 +210,7 @@ class OpenDriveFibStrategy:
                     if row['high'] > first5_high:
                         sell_setup_invalid = True
 
-                # === BUY IMPULSE TRACKING ===
+                # === BUY IMPULSE (can complete on any bar) ===
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if buy_swing_high is None:
                         buy_swing_high = row['high']
@@ -223,10 +220,11 @@ class OpenDriveFibStrategy:
                     impulse_threshold = first5_high * (1 + self.config.MIN_IMPULSE_PCT / 100)
                     if buy_swing_high >= impulse_threshold:
                         buy_impulse_done = True
+                        buy_impulse_bar = i
                         buy_fib_50 = buy_swing_high - self.config.FIB_LEVEL_1 * (buy_swing_high - first5_low)
                         buy_fib_618 = buy_swing_high - self.config.FIB_LEVEL_2 * (buy_swing_high - first5_low)
 
-                # === SELL IMPULSE TRACKING ===
+                # === SELL IMPULSE ===
                 if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
                     if sell_swing_low is None:
                         sell_swing_low = row['low']
@@ -236,22 +234,28 @@ class OpenDriveFibStrategy:
                     impulse_threshold = first5_low * (1 - self.config.MIN_IMPULSE_PCT / 100)
                     if sell_swing_low <= impulse_threshold:
                         sell_impulse_done = True
+                        sell_impulse_bar = i
                         sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
                         sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
 
-                # === BUY RETRACEMENT (must be on NEXT candle after impulse) ===
-                if buy_impulse_done and not buy_retraced:
+                # === BUY RETRACEMENT (MUST be on bar AFTER impulse bar) ===
+                # Pine: if buyImpulseDone[1] and not buyRetraced
+                # This means: impulse was done on PREVIOUS bar (i-1), now check current bar (i)
+                if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
                     if row['low'] <= buy_fib_50:
                         buy_retraced = True
+                        buy_retrace_bar = i
 
-                # === SELL RETRACEMENT (must be on NEXT candle after impulse) ===
-                if sell_impulse_done and not sell_retraced:
+                # === SELL RETRACEMENT (MUST be on bar AFTER impulse bar) ===
+                if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
                     if row['high'] >= sell_fib_50:
                         sell_retraced = True
+                        sell_retrace_bar = i
 
-                # === BUY RECOVERY (must be on NEXT candle after retrace) ===
-                # Green candle closing above fib_50
-                if buy_retraced and not buy_signal_fired and not buy_setup_invalid:
+                # === BUY RECOVERY (MUST be on bar AFTER retrace bar) ===
+                # Pine: buyRecovering = buyRetraced and isGreen and close > buyRetracementZone
+                # buyRetraced was set on previous bar, now check current bar
+                if buy_retraced and not buy_signal_fired and i > buy_retrace_bar and not buy_setup_invalid:
                     is_green = row['close'] > row['open']
                     if is_green and row['close'] > buy_fib_50:
                         # Check EMA conditions
@@ -281,11 +285,10 @@ class OpenDriveFibStrategy:
                                 'trend': 'UP'
                             }
                             buy_signal_fired = True
-                            break  # Signal once per day
+                            break
 
-                # === SELL RESUMPTION (must be on NEXT candle after retrace) ===
-                # Red candle closing below fib_50
-                if sell_retraced and not sell_signal_fired and not sell_setup_invalid:
+                # === SELL RESUMPTION (MUST be on bar AFTER retrace bar) ===
+                if sell_retraced and not sell_signal_fired and i > sell_retrace_bar and not sell_setup_invalid:
                     is_red = row['close'] < row['open']
                     if is_red and row['close'] < sell_fib_50:
                         # Check EMA conditions
@@ -315,7 +318,7 @@ class OpenDriveFibStrategy:
                                 'trend': 'DOWN'
                             }
                             sell_signal_fired = True
-                            break  # Signal once per day
+                            break
 
             return signal
 
