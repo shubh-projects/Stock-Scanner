@@ -133,9 +133,10 @@ class OpenDriveFibStrategy:
     def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
         """
         EXACT Pine Script logic mirror with [1] bar gap enforcement.
-        CRITICAL FIX: Setup invalidation only applies BEFORE impulse completes.
-        Once impulse is locked in, the pattern is valid even if price later
-        crosses the first 5m extreme (as seen on SAIL 30 Apr).
+        CRITICAL FIXES:
+        1. Process i=0 (first 15m bar) — Pine Script does NOT skip it.
+           The first 15m bar's high/low are essential for impulse tracking.
+        2. Setup invalidation only applies BEFORE impulse completes.
         """
         debug_lines = []
         def log(msg):
@@ -150,7 +151,7 @@ class OpenDriveFibStrategy:
 
             target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
 
-            # Filter to target date AND market hours (9:15 onwards) to avoid pre-market pollution
+            # Filter to target date AND market hours (9:15 onwards)
             df_5min_today = df_5min[
                 (df_5min.index.date == target_date) & 
                 (df_5min.index.time >= pd.Timestamp('09:15').time())
@@ -224,16 +225,13 @@ class OpenDriveFibStrategy:
 
             signal = None
 
+            # =================================================================
+            # MAIN LOOP — DO NOT SKIP i=0. Pine Script processes the first 15m bar
+            # for invalidation, impulse, and everything else.
+            # =================================================================
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
-                if i == 0:
-                    continue
 
-                # =================================================================
-                # SETUP INVALIDATION — ONLY BEFORE IMPULSE COMPLETES
-                # Once impulse is locked in, pattern is valid even if price later
-                # crosses first5 extreme (SAIL 30 Apr case: signal at ~11:00, 
-                # invalidation at 14:30 bar 21)
-                # =================================================================
+                # === SETUP INVALIDATION — ONLY BEFORE IMPULSE COMPLETES ===
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
@@ -246,9 +244,7 @@ class OpenDriveFibStrategy:
                         if debug_mode:
                             log(f"  ❌ SELL INVALIDATED at bar {i} {idx.strftime('%H:%M')} (high={row['high']:.2f} > first5_high={first5_high:.2f})")
 
-                # =================================================================
-                # BUY IMPULSE
-                # =================================================================
+                # === BUY IMPULSE ===
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if buy_swing_high is None:
                         buy_swing_high = float(row['high'])
@@ -264,9 +260,7 @@ class OpenDriveFibStrategy:
                         if debug_mode:
                             log(f"  📈 BUY IMPULSE DONE at bar {i} {idx.strftime('%H:%M')} | swing_high={buy_swing_high:.2f} | fib50={buy_fib_50:.2f}")
 
-                # =================================================================
-                # SELL IMPULSE
-                # =================================================================
+                # === SELL IMPULSE ===
                 if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
                     if sell_swing_low is None:
                         sell_swing_low = float(row['low'])
@@ -282,9 +276,7 @@ class OpenDriveFibStrategy:
                         if debug_mode:
                             log(f"  📉 SELL IMPULSE DONE at bar {i} {idx.strftime('%H:%M')} | swing_low={sell_swing_low:.2f} | fib50={sell_fib_50:.2f}")
 
-                # =================================================================
-                # BUY RETRACEMENT (bar AFTER impulse)
-                # =================================================================
+                # === BUY RETRACEMENT (bar AFTER impulse) ===
                 if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
                     if row['low'] <= buy_fib_50:
                         buy_retraced = True
@@ -292,9 +284,7 @@ class OpenDriveFibStrategy:
                         if debug_mode:
                             log(f"  🔄 BUY RETRACED at bar {i} {idx.strftime('%H:%M')} | low={row['low']:.2f} <= fib50={buy_fib_50:.2f}")
 
-                # =================================================================
-                # SELL RETRACEMENT (bar AFTER impulse)
-                # =================================================================
+                # === SELL RETRACEMENT (bar AFTER impulse) ===
                 if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
                     if row['high'] >= sell_fib_50:
                         sell_retraced = True
@@ -302,13 +292,10 @@ class OpenDriveFibStrategy:
                         if debug_mode:
                             log(f"  🔄 SELL RETRACED at bar {i} {idx.strftime('%H:%M')} | high={row['high']:.2f} >= fib50={sell_fib_50:.2f}")
 
-                # =================================================================
-                # BUY RECOVERY (bar AFTER retrace)
-                # =================================================================
+                # === BUY RECOVERY (bar AFTER retrace) ===
                 if buy_retraced and not buy_signal_fired and i > buy_retrace_bar:
                     is_green = row['close'] > row['open']
                     
-                    # Debug signal attempt
                     if debug_mode:
                         is_uptrend_dbg, _ = self.check_trend(df_15min_today.iloc[:i+1])
                         price_above_dbg = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
@@ -345,13 +332,10 @@ class OpenDriveFibStrategy:
                                 log(f"  ✅ BUY SIGNAL FIRED at bar {i} {idx.strftime('%H:%M')} | entry={entry:.2f}")
                             break
 
-                # =================================================================
-                # SELL RESUMPTION (bar AFTER retrace)
-                # =================================================================
+                # === SELL RESUMPTION (bar AFTER retrace) ===
                 if sell_retraced and not sell_signal_fired and i > sell_retrace_bar:
                     is_red = row['close'] < row['open']
                     
-                    # Debug signal attempt
                     if debug_mode:
                         _, is_downtrend_dbg = self.check_trend(df_15min_today.iloc[:i+1])
                         price_below_dbg = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
@@ -389,7 +373,7 @@ class OpenDriveFibStrategy:
                             break
 
             # =================================================================
-            # FINAL SUMMARY — Show ALL reasons, not just the first one
+            # FINAL SUMMARY
             # =================================================================
             if debug_mode:
                 if signal:
