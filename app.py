@@ -130,8 +130,8 @@ class OpenDriveFibStrategy:
 
         return is_uptrend, is_downtrend
 
-        def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
-            debug_lines = []
+    def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
+        debug_lines = []
         def log(msg):
             debug_lines.append(msg)
 
