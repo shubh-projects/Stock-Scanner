@@ -32,9 +32,9 @@ st.markdown("""
     .metric-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1rem; border-radius: 10px; color: white; text-align: center; }
     .live-badge { background-color: #ff4b4b; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; font-weight: bold; animation: blink 2s infinite; }
     @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-    .signal-card { padding: 1rem; border-radius: 8px; margin: 0.5rem 0; }
-    .buy-card { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); color: white; }
-    .sell-card { background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%); color: white; }
+    .signal-card { padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid; }
+    .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
+    .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -70,18 +70,18 @@ def check_password():
         return True
 
 # ================================================================================
-# STRATEGY LOGIC — FIBONACCI RETRACEMENT EDITION
+# STRATEGY LOGIC — EXACT PINE SCRIPT MIRROR
 # ================================================================================
 class Config:
     EMA_FAST = 20
     EMA_SLOW = 50
-    FIB_LEVEL_1 = 0.50      # Must cross this level
-    FIB_LEVEL_2 = 0.618     # Near this level is acceptable
-    MIN_IMPULSE_PCT = 0.5   # Minimum impulse move %
-    FIXED_IMPULSE_AMT = 5.0 # Fixed ₹ amount (if used instead of %)
+    FIB_LEVEL_1 = 0.50
+    FIB_LEVEL_2 = 0.618
+    MIN_IMPULSE_PCT = 0.5
+    FIXED_IMPULSE_AMT = 5.0
     USE_FIXED_IMPULSE = False
-    USE_10M_CONFIRM = True
     DEFAULT_TARGET_RR = 2.0
+    OHL_TOLERANCE = 0.01
 
 class OpenDriveFibStrategy:
     def __init__(self):
@@ -101,29 +101,29 @@ class OpenDriveFibStrategy:
 
             formatted_symbol = symbol.replace('.NS', '')
             df = tv_instance.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
-            
+
             if df is None or df.empty:
                 return pd.DataFrame()
 
             df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
             df.index = pd.to_datetime(df.index)
-            
+
             if df.index.tz is None:
                 df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
             else:
                 df.index = df.index.tz_convert('Asia/Kolkata')
-                
+
             return df
         except Exception as e:
             return pd.DataFrame()
-    
+
     def calculate_ema(self, df, period):
         return df['close'].ewm(span=period, adjust=False).mean()
 
     def check_trend(self, df):
         if len(df) < 2:
             return False, False
-        
+
         ema20_now, ema20_prev = df['ema20'].iloc[-1], df['ema20'].iloc[-2]
         ema50_now, ema50_prev = df['ema50'].iloc[-1], df['ema50'].iloc[-2]
 
@@ -132,183 +132,192 @@ class OpenDriveFibStrategy:
 
         return is_uptrend, is_downtrend
 
-    def check_first_5min_candle(self, df_5min, tolerance=0.05):
-        """Check if first 5m candle is Open=Low (buy setup) or Open=High (sell setup)"""
-        if df_5min.empty:
-            return None, None
-        
-        first = df_5min.iloc[0]
-        o, h, l = first['open'], first['high'], first['low']
-        
-        if abs(o - l) <= tolerance:
-            return 'buy', {'open': o, 'high': h, 'low': l, 'time': df_5min.index[0]}
-        elif abs(o - h) <= tolerance:
-            return 'sell', {'open': o, 'high': h, 'low': l, 'time': df_5min.index[0]}
-        return None, None
-
-    def scan_stock(self, tv_instance, symbol, scan_date, tolerance=0.05):
+    def scan_stock(self, tv_instance, symbol, scan_date, tolerance=0.01):
         """
-        Full Fibonacci retracement scan for one stock.
-        Returns signal dict if valid, else None.
+        EXACT Pine Script logic mirror:
+        1. Get first 5m candle
+        2. Check Open=Low or Open=High
+        3. Track impulse (price must move beyond threshold)
+        4. Check invalidation (break of first 5m low/high)
+        5. Calculate Fib levels at impulse completion
+        6. Wait for retracement to Fib 0.5
+        7. Wait for recovery candle (green for buy, red for sell)
+        8. Check EMA conditions
+        9. Signal fires once per day only
         """
         try:
-            # Fetch data
             df_5min = self.get_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
             df_15min = self.get_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
-            
+
             if df_5min.empty or df_15min.empty:
                 return None
 
-            # Filter to scan date
             target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
-            df_5min_today = df_5min[df_5min.index.date == target_date]
-            df_15min_today = df_15min[df_15min.index.date == target_date]
-            
+
+            # Filter to target date
+            df_5min_today = df_5min[df_5min.index.date == target_date].copy()
+            df_15min_today = df_15min[df_15min.index.date == target_date].copy()
+
             if df_5min_today.empty or df_15min_today.empty:
                 return None
 
-            # Check first 5m candle setup
-            setup_type, first_candle = self.check_first_5min_candle(df_5min_today, tolerance)
-            if setup_type is None:
+            # Get first 5m candle (should be 9:15)
+            first_5m = df_5min_today.iloc[0]
+            first5_open = first_5m['open']
+            first5_high = first_5m['high']
+            first5_low = first_5m['low']
+
+            # Check setup
+            first5_is_buy_setup = abs(first5_open - first5_low) <= tolerance
+            first5_is_sell_setup = abs(first5_open - first5_high) <= tolerance
+
+            if not first5_is_buy_setup and not first5_is_sell_setup:
                 return None
 
-            first_open = first_candle['open']
-            first_high = first_candle['high']
-            first_low = first_candle['low']
-
-            # === SETUP INVALIDATION ===
-            # Buy setup invalid if ANY candle breaks below first 5m low
-            # Sell setup invalid if ANY candle breaks above first 5m high
-            if setup_type == 'buy':
-                if (df_15min_today['low'] < first_low).any():
-                    return None  # Setup invalidated
-            else:
-                if (df_15min_today['high'] > first_high).any():
-                    return None  # Setup invalidated
-
-            # === CALCULATE EMAS ON 15M ===
+            # Calculate EMAs on 15m
             df_15min_today = df_15min_today.copy()
             df_15min_today['ema20'] = self.calculate_ema(df_15min_today, self.config.EMA_FAST)
             df_15min_today['ema50'] = self.calculate_ema(df_15min_today, self.config.EMA_SLOW)
 
-            # === IMPULSE PHASE ===
-            # Buy: Price must go up above first_high by min threshold
-            # Sell: Price must go down below first_low by min threshold
-            impulse_threshold = self.config.FIXED_IMPULSE_AMT if self.config.USE_FIXED_IMPULSE else (first_high * self.config.MIN_IMPULSE_PCT / 100)
-            
-            if setup_type == 'buy':
-                swing_high = df_15min_today['high'].max()
-                min_required = first_high + impulse_threshold
-                if swing_high < min_required:
-                    return None  # No impulse
-            else:
-                swing_low = df_15min_today['low'].min()
-                min_required = first_low - impulse_threshold
-                if swing_low > min_required:
-                    return None  # No impulse
+            # === PHASE TRACKING (exact Pine Script mirror) ===
+            buy_swing_high = None
+            buy_fib_50 = None
+            buy_fib_618 = None
+            buy_impulse_done = False
+            buy_retraced = False
+            buy_signal_fired = False
 
-            # === FIBONACCI RETRACEMENT LEVELS ===
-            if setup_type == 'buy':
-                fib_50 = swing_high - self.config.FIB_LEVEL_1 * (swing_high - first_low)
-                fib_618 = swing_high - self.config.FIB_LEVEL_2 * (swing_high - first_low)
-            else:
-                fib_50 = swing_low + self.config.FIB_LEVEL_1 * (first_high - swing_low)
-                fib_618 = swing_low + self.config.FIB_LEVEL_2 * (first_high - swing_low)
+            sell_swing_low = None
+            sell_fib_50 = None
+            sell_fib_618 = None
+            sell_impulse_done = False
+            sell_retraced = False
+            sell_signal_fired = False
 
-            # === RETRACEMENT PHASE ===
-            # Buy: Price must drop to or below fib_50
-            # Sell: Price must bounce to or above fib_50
-            retraced = False
-            retrace_idx = None
-            
+            # Setup invalidation tracking
+            buy_setup_invalid = False
+            sell_setup_invalid = False
+
+            signal = None
+
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
                 if i == 0:
-                    continue  # Skip first candle (impulse might be forming)
-                
-                if setup_type == 'buy':
-                    if row['low'] <= fib_50:
-                        retraced = True
-                        retrace_idx = i
-                        break
-                else:
-                    if row['high'] >= fib_50:
-                        retraced = True
-                        retrace_idx = i
-                        break
-            
-            if not retraced:
-                return None
+                    continue  # Skip first candle (it's the 9:15 or first 15m candle)
 
-            # === RECOVERY / RESUMPTION PHASE ===
-            # Buy: Green candle closing above fib_50
-            # Sell: Red candle closing below fib_50
-            # Optional 10m confirmation
-            signal_candle = None
-            signal_idx = None
-            
-            for i, (idx, row) in enumerate(df_15min_today.iterrows()):
-                if i <= retrace_idx:
-                    continue  # Must be after retrace candle
-                
-                is_green = row['close'] > row['open']
-                is_red = row['close'] < row['open']
-                
-                if setup_type == 'buy':
-                    if is_green and row['close'] > fib_50:
-                        signal_candle = row
-                        signal_idx = i
-                        break
-                else:
-                    if is_red and row['close'] < fib_50:
-                        signal_candle = row
-                        signal_idx = i
-                        break
+                # === SETUP INVALIDATION (same as Pine Script) ===
+                if first5_is_buy_setup and not buy_setup_invalid:
+                    if row['low'] < first5_low:
+                        buy_setup_invalid = True
 
-            if signal_candle is None:
-                return None
+                if first5_is_sell_setup and not sell_setup_invalid:
+                    if row['high'] > first5_high:
+                        sell_setup_invalid = True
 
-            # === EMA & TREND CONDITIONS ===
-            df_up_to_signal = df_15min_today.iloc[:signal_idx+1]
-            is_uptrend, is_downtrend = self.check_trend(df_up_to_signal)
-            
-            if setup_type == 'buy':
-                if not (signal_candle['close'] > signal_candle['ema20'] and 
-                        signal_candle['close'] > signal_candle['ema50'] and 
-                        is_uptrend):
-                    return None
-            else:
-                if not (signal_candle['close'] < signal_candle['ema20'] and 
-                        signal_candle['close'] < signal_candle['ema50'] and 
-                        is_downtrend):
-                    return None
+                # === BUY IMPULSE TRACKING ===
+                if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
+                    if buy_swing_high is None:
+                        buy_swing_high = row['high']
+                    else:
+                        buy_swing_high = max(buy_swing_high, row['high'])
 
-            # === BUILD SIGNAL ===
-            entry = signal_candle['close']
-            if setup_type == 'buy':
-                sl = signal_candle['low']
-                target = entry + (entry - sl) * self.config.DEFAULT_TARGET_RR
-            else:
-                sl = signal_candle['high']
-                target = entry - (sl - entry) * self.config.DEFAULT_TARGET_RR
+                    impulse_threshold = first5_high * (1 + self.config.MIN_IMPULSE_PCT / 100)
+                    if buy_swing_high >= impulse_threshold:
+                        buy_impulse_done = True
+                        buy_fib_50 = buy_swing_high - self.config.FIB_LEVEL_1 * (buy_swing_high - first5_low)
+                        buy_fib_618 = buy_swing_high - self.config.FIB_LEVEL_2 * (buy_swing_high - first5_low)
 
-            return {
-                'symbol': symbol.replace('.NS', ''),
-                'date': target_date.strftime('%Y-%m-%d'),
-                'direction': 'BUY' if setup_type == 'buy' else 'SELL',
-                'setup_time': first_candle['time'].strftime('%H:%M'),
-                'signal_time': df_15min_today.index[signal_idx].strftime('%H:%M'),
-                'entry_price': round(entry, 2),
-                'stop_loss': round(sl, 2),
-                'target': round(target, 2),
-                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
-                'fib_50': round(fib_50, 2),
-                'fib_618': round(fib_618, 2),
-                'swing_high': round(swing_high, 2) if setup_type == 'buy' else None,
-                'swing_low': round(swing_low, 2) if setup_type == 'sell' else None,
-                'ema20': round(signal_candle['ema20'], 2),
-                'ema50': round(signal_candle['ema50'], 2),
-                'trend': 'UP' if is_uptrend else 'DOWN'
-            }
+                # === SELL IMPULSE TRACKING ===
+                if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
+                    if sell_swing_low is None:
+                        sell_swing_low = row['low']
+                    else:
+                        sell_swing_low = min(sell_swing_low, row['low'])
+
+                    impulse_threshold = first5_low * (1 - self.config.MIN_IMPULSE_PCT / 100)
+                    if sell_swing_low <= impulse_threshold:
+                        sell_impulse_done = True
+                        sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
+                        sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
+
+                # === BUY RETRACEMENT (must be on NEXT candle after impulse) ===
+                if buy_impulse_done and not buy_retraced:
+                    if row['low'] <= buy_fib_50:
+                        buy_retraced = True
+
+                # === SELL RETRACEMENT (must be on NEXT candle after impulse) ===
+                if sell_impulse_done and not sell_retraced:
+                    if row['high'] >= sell_fib_50:
+                        sell_retraced = True
+
+                # === BUY RECOVERY (must be on NEXT candle after retrace) ===
+                # Green candle closing above fib_50
+                if buy_retraced and not buy_signal_fired and not buy_setup_invalid:
+                    is_green = row['close'] > row['open']
+                    if is_green and row['close'] > buy_fib_50:
+                        # Check EMA conditions
+                        is_uptrend, _ = self.check_trend(df_15min_today.iloc[:i+1])
+                        price_above_emas = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
+
+                        if price_above_emas and is_uptrend:
+                            entry = row['close']
+                            sl = row['low']
+                            target = entry + (entry - sl) * self.config.DEFAULT_TARGET_RR
+
+                            signal = {
+                                'symbol': symbol.replace('.NS', ''),
+                                'date': target_date.strftime('%Y-%m-%d'),
+                                'direction': 'BUY',
+                                'setup_time': df_5min_today.index[0].strftime('%H:%M'),
+                                'signal_time': idx.strftime('%H:%M'),
+                                'entry_price': round(entry, 2),
+                                'stop_loss': round(sl, 2),
+                                'target': round(target, 2),
+                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
+                                'fib_50': round(buy_fib_50, 2),
+                                'fib_618': round(buy_fib_618, 2),
+                                'swing_high': round(buy_swing_high, 2),
+                                'ema20': round(row['ema20'], 2),
+                                'ema50': round(row['ema50'], 2),
+                                'trend': 'UP'
+                            }
+                            buy_signal_fired = True
+                            break  # Signal once per day
+
+                # === SELL RESUMPTION (must be on NEXT candle after retrace) ===
+                # Red candle closing below fib_50
+                if sell_retraced and not sell_signal_fired and not sell_setup_invalid:
+                    is_red = row['close'] < row['open']
+                    if is_red and row['close'] < sell_fib_50:
+                        # Check EMA conditions
+                        _, is_downtrend = self.check_trend(df_15min_today.iloc[:i+1])
+                        price_below_emas = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
+
+                        if price_below_emas and is_downtrend:
+                            entry = row['close']
+                            sl = row['high']
+                            target = entry - (sl - entry) * self.config.DEFAULT_TARGET_RR
+
+                            signal = {
+                                'symbol': symbol.replace('.NS', ''),
+                                'date': target_date.strftime('%Y-%m-%d'),
+                                'direction': 'SELL',
+                                'setup_time': df_5min_today.index[0].strftime('%H:%M'),
+                                'signal_time': idx.strftime('%H:%M'),
+                                'entry_price': round(entry, 2),
+                                'stop_loss': round(sl, 2),
+                                'target': round(target, 2),
+                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
+                                'fib_50': round(sell_fib_50, 2),
+                                'fib_618': round(sell_fib_618, 2),
+                                'swing_low': round(sell_swing_low, 2),
+                                'ema20': round(row['ema20'], 2),
+                                'ema50': round(row['ema50'], 2),
+                                'trend': 'DOWN'
+                            }
+                            sell_signal_fired = True
+                            break  # Signal once per day
+
+            return signal
 
         except Exception as e:
             return None
@@ -321,8 +330,11 @@ def display_results(signals, scan_date):
         st.warning("⚠️ No signals found. No stocks met all Fibonacci retracement conditions.")
         return
 
-    df = pd.DataFrame(signals)
-    
+    df = pd.DataFrame([s for s in signals if s is not None])
+    if df.empty:
+        st.warning("⚠️ No valid signals found.")
+        return
+
     # Metrics
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -340,12 +352,15 @@ def display_results(signals, scan_date):
     # Display each signal as a card
     for _, row in df.iterrows():
         card_class = "buy-card" if row['direction'] == 'BUY' else "sell-card"
+        swing_text = f"Swing High: {row.get('swing_high', 'N/A')}" if row['direction'] == 'BUY' else f"Swing Low: {row.get('swing_low', 'N/A')}"
+
         st.markdown(f"""
         <div class="signal-card {card_class}">
             <h4>{row['symbol']} — {row['direction']} @ {row['entry_price']}</h4>
             <p><b>Setup:</b> {row['setup_time']} | <b>Signal:</b> {row['signal_time']} | <b>Trend:</b> {row['trend']}</p>
             <p><b>Entry:</b> {row['entry_price']} | <b>SL:</b> {row['stop_loss']} | <b>TGT:</b> {row['target']} | <b>R:R:</b> {row['risk_reward']}</p>
-            <p><b>Fib 0.5:</b> {row['fib_50']} | <b>Fib 0.618:</b> {row['fib_618']} | <b>EMA20:</b> {row['ema20']} | <b>EMA50:</b> {row['ema50']}</p>
+            <p><b>Fib 0.5:</b> {row['fib_50']} | <b>Fib 0.618:</b> {row['fib_618']} | {swing_text}</p>
+            <p><b>EMA20:</b> {row['ema20']} | <b>EMA50:</b> {row['ema50']}</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -361,14 +376,14 @@ def main():
         st.stop()
 
     st.markdown('<div class="main-header">📈 Open Drive Fib Scanner</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Scans 110 NSE stocks for Open=Low/High + Fib Retracement + EMA alignment</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Scans NSE stocks for Open=Low/High + Fib Retracement + EMA alignment</div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("⚙️ Settings")
-        
+
         scan_mode = st.radio("Select Mode:", ["Historical Scan", "Real-Time Scan"])
         scan_date = st.date_input("Scan Date", value=datetime.now(IST) - timedelta(days=1), max_value=datetime.now(IST))
-        
+
         st.markdown("---")
         st.subheader("📋 Stock List")
         input_method = st.radio("Input method:", ["Paste Symbols", "Use Default List"])
@@ -403,8 +418,8 @@ def main():
         fib_618 = st.number_input("Fib Level 2 (0.618)", value=0.618, min_value=0.10, max_value=0.90, step=0.001)
         impulse_pct = st.number_input("Min Impulse %", value=0.5, min_value=0.1, max_value=5.0, step=0.1)
         rr = st.number_input("Risk:Reward Ratio", value=2.0, min_value=1.0, max_value=5.0, step=0.5)
-        tolerance = st.number_input("Open=High/Low Tolerance (₹)", value=0.05, min_value=0.01, max_value=1.0, step=0.01)
-        
+        tolerance = st.number_input("Open=High/Low Tolerance (₹)", value=0.01, min_value=0.01, max_value=1.0, step=0.01)
+
         st.markdown("---")
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
@@ -422,6 +437,7 @@ def main():
         strategy.config.FIB_LEVEL_2 = fib_618
         strategy.config.MIN_IMPULSE_PCT = impulse_pct
         strategy.config.DEFAULT_TARGET_RR = rr
+        strategy.config.OHL_TOLERANCE = tolerance
 
         progress_container = st.empty()
         with progress_container.container():
@@ -442,13 +458,13 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
             futures = {executor.submit(process_stock, task): task for task in tasks}
-            
+
             for future in concurrent.futures.as_completed(futures):
                 completed += 1
                 if completed % 5 == 0 or completed == total:
                     progress_bar.progress(completed / total)
                     status_text.text(f"⚡ Scanning... ({completed}/{total})")
-                
+
                 try:
                     res = future.result()
                     if res:
@@ -474,9 +490,10 @@ def main():
         strategy.config.FIB_LEVEL_2 = fib_618
         strategy.config.MIN_IMPULSE_PCT = impulse_pct
         strategy.config.DEFAULT_TARGET_RR = rr
+        strategy.config.OHL_TOLERANCE = tolerance
 
         live_container = st.empty()
-        
+
         def process_live(task_data):
             idx, sym, target_time = task_data
             tv_inst = tv_pool[idx % 5]
@@ -487,7 +504,7 @@ def main():
             all_signals = []
             live_datetime = datetime.now(IST)
             current_time = live_datetime.time()
-            
+
             is_market_open = (live_datetime.weekday() < 5 and 
                 current_time >= datetime.strptime("09:15", "%H:%M").time() and 
                 current_time <= datetime.strptime("15:30", "%H:%M").time())
@@ -503,13 +520,13 @@ def main():
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
                 futures = {executor.submit(process_live, task): task for task in tasks}
-                
+
                 for future in concurrent.futures.as_completed(futures):
                     completed += 1
                     if completed % 5 == 0 or completed == total:
                         live_progress.progress(completed / total)
                         live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
-                    
+
                     try:
                         res = future.result()
                         if res:
@@ -523,7 +540,7 @@ def main():
                 market_status = "🟢 Market Open" if is_market_open else "🔴 Market Closed"
                 st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | {market_status}")
                 display_results(all_signals, live_datetime)
-                
+
             time.sleep(60 if not is_market_open else 5)
 
     elif not stock_list:
