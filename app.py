@@ -401,16 +401,15 @@ def main():
 
         default_symbols = (
             "HDFCBANK.NS
-AXISBANK.NS
-ICICIBANK.NS
-KOTAKBANK.NS
-RBLBANK.NS
-FEDERALBANK.NS
-BANDHANBANK.NS
-AUBANK.NS
-INDUSINDBANK.NS
-IDFCFIRSTBANK.NS
-"
+            AXISBANK.NS
+            ICICIBANK.NS
+            KOTAKBANK.NS
+            RBLBANK.NS
+            FEDERALBANK.NS
+            BANDHANBANK.NS
+            AUBANK.NS
+            INDUSINDBANK.NS
+            IDFCFIRSTBANK.NS"
             "SBIN.NS
 BANKBARODA.NS
 CANBANK.NS
