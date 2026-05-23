@@ -5,10 +5,7 @@ from datetime import datetime, timedelta, timezone
 import time
 import warnings
 import logging
-import subprocess
-import sys
-import json
-import os
+import threading
 from tvDatafeed import TvDatafeed, Interval
 
 warnings.filterwarnings('ignore')
@@ -26,7 +23,7 @@ class Config:
     FIB_LEVEL_2 = 0.618
     MIN_IMPULSE_PCT = 0.5
     DEFAULT_TARGET_RR = 2.0
-    PER_STOCK_TIMEOUT = 15  # Seconds before killing the subprocess
+    TIMEOUT_SECONDS = 12  # Max wait per stock
 
 # ================================================================================
 # UI SETUP
@@ -170,8 +167,6 @@ def scan_stock(tv, symbol, target_date, tolerance_pct):
         sell_ret = False; sell_ret_bar = -1; sell_sig = False
         sell_sl = None; sell_f50 = None; sell_f618 = None
 
-        signal = None
-
         for i, (idx, row) in enumerate(df_15_today.iterrows()):
             if i == 0:
                 if buy_setup and row['low'] < f_low:
@@ -247,41 +242,30 @@ def scan_stock(tv, symbol, target_date, tolerance_pct):
         return {"_error": True, "_reason": str(e), "symbol": sym_clean}
 
 # ================================================================================
-# SUBPROCESS WORKER — ISOLATED PROCESS WITH HARD TIMEOUT
+# THREAD-BASED TIMEOUT (cross-platform)
 # ================================================================================
 def scan_with_timeout(tv_pool, idx, symbol, target_date, tolerance_pct):
     """
-    Run scan_stock in a subprocess with a hard timeout.
-    If the process hangs, we kill it and return an error.
+    Run scan_stock in a thread with timeout.
+    Returns result or error dict if timeout.
     """
-    # Write the scan logic to a temporary script and execute it
-    # This is heavy but guarantees isolation
+    result_container = {}
     
-    # Actually, a simpler approach: use a separate script file
-    # For now, use direct call with manual timeout check
-    tv = tv_pool.get(idx)
+    def worker():
+        tv = tv_pool.get(idx)
+        result_container['result'] = scan_stock(tv, symbol, target_date, tolerance_pct)
     
-    # Use alarm signal for timeout (Linux only, works on Streamlit Cloud)
-    import signal
+    thread = threading.Thread(target=worker)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=Config.TIMEOUT_SECONDS)
     
-    class TimeoutException(Exception):
-        pass
-    
-    def handler(signum, frame):
-        raise TimeoutException()
-    
-    # Set alarm
-    old_handler = signal.signal(signal.SIGALRM, handler)
-    signal.alarm(Config.PER_STOCK_TIMEOUT)
-    
-    try:
-        result = scan_stock(tv, symbol, target_date, tolerance_pct)
-        signal.alarm(0)  # Cancel alarm
-        signal.signal(signal.SIGALRM, old_handler)
-        return result
-    except TimeoutException:
-        signal.signal(signal.SIGALRM, old_handler)
+    if thread.is_alive():
+        # Thread is still running (hung in tvDatafeed)
+        # We can't kill it, but we abandon it and move on
         return {"_error": True, "_reason": "timeout", "symbol": symbol.replace('.NS', '')}
+    
+    return result_container.get('result', {"_error": True, "_reason": "no_result", "symbol": symbol.replace('.NS', '')})
 
 # ================================================================================
 # DISPLAY
@@ -399,7 +383,7 @@ def main():
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN — SIMPLE LOOP WITH TIMEOUT
+    # HISTORICAL SCAN
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
@@ -418,7 +402,6 @@ def main():
         total = len(stock_list)
 
         for i, symbol in enumerate(stock_list):
-            # Update progress every stock
             bar.progress((i + 1) / total)
             status.text(f"⚡ Scanning... ({i+1}/{total}) — {symbol.replace('.NS', '')}")
 
@@ -429,9 +412,8 @@ def main():
                 all_results.append(result)
             elif result is not None:
                 all_results.append(result)
-            # If None, valid no-setup — skip
 
-        # Retry failed stocks once
+        # Retry failed stocks
         if failed_symbols:
             status.text(f"🔄 Retrying {len(failed_symbols)} failed stocks...")
             time.sleep(1)
@@ -439,7 +421,6 @@ def main():
             for symbol in failed_symbols:
                 result = scan_with_timeout(tv_pool, 999, symbol, target_date, tolerance_pct)
                 if not (isinstance(result, dict) and result.get("_error")):
-                    # Remove old error, add new result
                     all_results = [r for r in all_results if not (isinstance(r, dict) and r.get("symbol") == symbol.replace('.NS', '') and r.get("_error"))]
                     if result is not None:
                         all_results.append(result)
