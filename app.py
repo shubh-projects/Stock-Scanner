@@ -8,11 +8,6 @@ import warnings
 import logging
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
-import asyncio
-import aiohttp
-import json
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
 from tvDatafeed import TvDatafeed, Interval
 
 # Mute warnings
@@ -22,162 +17,19 @@ logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
-# ULTIMATE SCALING CONFIGURATION
+# SCALING CONFIGURATION
 # ================================================================================
-@dataclass
-class UltimateScaleConfig:
-    # Layer 1: TV Pool (sync fallback)
-    TV_POOL_SIZE: int = 20
-    
-    # Layer 2: Async HTTP (primary)
-    ASYNC_WORKERS: int = 50          # Concurrent async requests
-    ASYNC_TIMEOUT: int = 10          # Seconds per request
-    MAX_CONNECTIONS: int = 100       # HTTP connection pool size
-    
-    # Layer 3: Thread Pool (CPU-bound EMA calc)
-    THREAD_WORKERS: int = 16         # For EMA calculations
-    
-    # Layer 4: Optimization
-    EARLY_EXIT: bool = True          # Skip EMA if no setup
-    CACHE_ENABLED: bool = True       # Cache TV data
-    BATCH_SIZE: int = 100            # Submit all at once
-    
-    # Layer 5: Pre-filter
-    SKIP_LOW_VOLATILITY: bool = True # Skip known dead stocks
-
-ULTIMATE = UltimateScaleConfig()
-
-# ================================================================================
-# ASYNC TRADINGVIEW CLIENT (Much faster than tvDatafeed)
-# ================================================================================
-class AsyncTVClient:
-    """Async HTTP client for TradingView — bypasses tvDatafeed WebSocket overhead."""
-    
-    def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.base_url = "https://prodata.tradingview.com"
-        
-    async def __aenter__(self):
-        connector = aiohttp.TCPConnector(
-            limit=ULTIMATE.MAX_CONNECTIONS,
-            limit_per_host=ULTIMATE.MAX_CONNECTIONS,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-        )
-        timeout = aiohttp.ClientTimeout(total=ULTIMATE.ASYNC_TIMEOUT)
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            headers={
-                'User-Agent': 'TradingView/1.0',
-                'Accept': 'application/json',
-            }
-        )
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-            
-    async def get_hist(self, symbol: str, exchange: str = 'NSE', 
-                       interval: str = '15', n_bars: int = 500) -> Optional[pd.DataFrame]:
-        """Fetch historical data via HTTP — much lighter than WebSocket."""
-        try:
-            # TradingView's lightweight history endpoint
-            url = f"{self.base_url}/history"
-            params = {
-                'symbol': f"{exchange}:{symbol}",
-                'resolution': interval,
-                'from': int((datetime.now() - timedelta(days=100)).timestamp()),
-                'to': int(datetime.now().timestamp()),
-                'countback': n_bars,
-            }
-            
-            async with self.session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                
-            if not data or 't' not in data or not data['t']:
-                return None
-                
-            df = pd.DataFrame({
-                'open': data['o'],
-                'high': data['h'],
-                'low': data['l'],
-                'close': data['c'],
-                'volume': data.get('v', [0]*len(data['t'])),
-            }, index=pd.to_datetime(data['t'], unit='s'))
-            
-            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-            return df
-            
-        except Exception:
-            return None
-
-# ================================================================================
-# HYBRID DATA FETCHER: Async primary, TV pool fallback
-# ================================================================================
-class HybridDataFetcher:
-    def __init__(self, tv_pool: List[TvDatafeed]):
-        self.tv_pool = tv_pool
-        self.tv_index = 0
-        self._lock = asyncio.Lock()
-        
-    async def fetch(self, symbol: str, resolution: int, days_back: int = 100) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Try async first, fallback to tvDatafeed."""
-        # Try async
-        async with AsyncTVClient() as client:
-            df_5 = await client.get_hist(symbol.replace('.NS', ''), 'NSE', '5', days_back * 75)
-            df_15 = await client.get_hist(symbol.replace('.NS', ''), 'NSE', '15', days_back * 25)
-            
-        if df_5 is not None and df_15 is not None:
-            return df_5, df_15
-            
-        # Fallback to sync TV pool
-        tv = self.tv_pool[self.tv_index % len(self.tv_pool)]
-        self.tv_index += 1
-        
-        # Run sync in thread pool
-        loop = asyncio.get_event_loop()
-        df_5 = await loop.run_in_executor(None, 
-            lambda: self._sync_fetch(tv, symbol, 5, days_back))
-        df_15 = await loop.run_in_executor(None,
-            lambda: self._sync_fetch(tv, symbol, 15, days_back))
-            
-        return df_5, df_15
-        
-    def _sync_fetch(self, tv, symbol, res, days):
-        try:
-            if res == 5:
-                interval = Interval.in_5_minute
-                bars = days * 75
-            else:
-                interval = Interval.in_15_minute
-                bars = days * 25
-                
-            df = tv.get_hist(symbol=symbol.replace('.NS', ''), 
-                           exchange='NSE', interval=interval, n_bars=bars)
-            if df is None or df.empty:
-                return pd.DataFrame()
-                
-            df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 
-                                   'close': 'close', 'volume': 'volume'})
-            df.index = pd.to_datetime(df.index)
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-            else:
-                df.index = df.index.tz_convert('Asia/Kolkata')
-            return df
-        except Exception:
-            return pd.DataFrame()
+class ScaleConfig:
+    TV_POOL_SIZE = 30           # 30 TV connections
+    MAX_THREAD_WORKERS = 25     # 25 concurrent threads
+    BASE_DELAY = 0.02           # Minimal delay
 
 # ================================================================================
 # PAGE UI & CSS
 # ================================================================================
 st.set_page_config(
-    page_title="Open Drive Fib Scanner ⚡ Ultimate",
-    page_icon="🚀",
+    page_title="Open Drive Fib Scanner",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -193,17 +45,16 @@ st.markdown("""
     .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
     .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
     .perf-card { background: #1e1e2e; padding: 0.8rem; border-radius: 6px; color: #a0a0b0; font-size: 0.85rem; }
-    .speed-badge { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================================================================================
-# TV POOL (sync fallback)
+# TV POOL
 # ================================================================================
 @st.cache_resource
 def get_tv_pool():
     pool = []
-    for i in range(ULTIMATE.TV_POOL_SIZE):
+    for i in range(ScaleConfig.TV_POOL_SIZE):
         try:
             pool.append(TvDatafeed())
             time.sleep(0.3)
@@ -235,7 +86,7 @@ def check_password():
         return True
 
 # ================================================================================
-# STRATEGY LOGIC WITH EARLY EXIT OPTIMIZATION
+# STRATEGY LOGIC
 # ================================================================================
 class Config:
     EMA_FAST = 20
@@ -249,6 +100,36 @@ class OpenDriveFibStrategy:
     def __init__(self):
         self.config = Config()
 
+    def get_historical_candles(self, tv_instance, symbol, resolution_minutes, is_live=False, days_back=100):
+        try:
+            if resolution_minutes == 5:
+                tv_interval = Interval.in_5_minute
+                bars_to_pull = 500 if is_live else (days_back * 75)
+            elif resolution_minutes == 10:
+                tv_interval = Interval.in_10_minute
+                bars_to_pull = 500 if is_live else (days_back * 50)
+            else:
+                tv_interval = Interval.in_15_minute
+                bars_to_pull = 500 if is_live else (days_back * 25)
+
+            formatted_symbol = symbol.replace('.NS', '')
+            df = tv_instance.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
+
+            if df is None or df.empty:
+                return pd.DataFrame()
+
+            df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
+            df.index = pd.to_datetime(df.index)
+
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_convert('Asia/Kolkata')
+
+            return df
+        except Exception as e:
+            return pd.DataFrame()
+
     def calculate_ema(self, df, period):
         return df['close'].ewm(span=period, adjust=False).mean()
 
@@ -261,10 +142,20 @@ class OpenDriveFibStrategy:
         is_downtrend = (ema20_now < ema50_now) and (ema20_now < ema20_prev) and (ema50_now < ema50_prev)
         return is_uptrend, is_downtrend
 
-    def scan_stock(self, df_5min: pd.DataFrame, df_15min: pd.DataFrame, 
-                   target_date, tolerance_pct: float) -> Optional[Dict]:
-        """Optimized scan with early exit if no setup."""
+    def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
         try:
+            df_5min = self.get_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
+            df_15min = self.get_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
+
+            if df_5min.empty or df_15min.empty:
+                return None
+
+            target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
+
+            # Calculate EMAs on FULL history first
+            df_15min['ema20'] = self.calculate_ema(df_15min, self.config.EMA_FAST)
+            df_15min['ema50'] = self.calculate_ema(df_15min, self.config.EMA_SLOW)
+
             # Filter to target date
             df_5min_today = df_5min[
                 (df_5min.index.date == target_date) & 
@@ -289,14 +180,10 @@ class OpenDriveFibStrategy:
             first5_is_buy_setup = abs(first5_open - first5_low) <= tolerance
             first5_is_sell_setup = abs(first5_open - first5_high) <= tolerance
 
-            sym_clean = df_5min_today.index[0].strftime('%Y-%m-%d')  # Placeholder, set by caller
+            sym_clean = symbol.replace('.NS', '')
 
             if not first5_is_buy_setup and not first5_is_sell_setup:
-                return None  # EARLY EXIT — no EMA calc needed!
-
-            # Only calculate EMAs if we have a valid setup
-            df_15min_today['ema20'] = self.calculate_ema(df_15min_today, self.config.EMA_FAST)
-            df_15min_today['ema50'] = self.calculate_ema(df_15min_today, self.config.EMA_SLOW)
+                return None
 
             # State variables
             buy_swing_high = None; buy_fib_50 = None; buy_fib_618 = None
@@ -311,7 +198,7 @@ class OpenDriveFibStrategy:
             signal = None
 
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
-                # Invalidation before impulse
+                # Invalidation ONLY before impulse completes
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
@@ -393,54 +280,6 @@ class OpenDriveFibStrategy:
             return None
 
 # ================================================================================
-# ASYNC SCAN ORCHESTRATOR
-# ================================================================================
-async def async_scan_all(stock_list: List[str], scan_date, tolerance_pct: float,
-                         strategy: OpenDriveFibStrategy, tv_pool: List[TvDatafeed],
-                         progress_bar, status_text):
-    """Ultra-fast async scan with hybrid data fetching."""
-    
-    fetcher = HybridDataFetcher(tv_pool)
-    target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
-    all_signals = []
-    completed = 0
-    total = len(stock_list)
-    
-    # Semaphore to limit concurrent requests
-    sem = asyncio.Semaphore(ULTIMATE.ASYNC_WORKERS)
-    
-    async def scan_one(symbol: str, idx: int) -> Optional[Dict]:
-        async with sem:
-            df_5, df_15 = await fetcher.fetch(symbol, 5)
-            
-            if df_5.empty or df_15.empty:
-                return None
-                
-            signal = strategy.scan_stock(df_5, df_15, target_date, tolerance_pct)
-            if signal:
-                signal['symbol'] = symbol.replace('.NS', '')
-            return signal
-    
-    # Create all tasks
-    tasks = [scan_one(sym, i) for i, sym in enumerate(stock_list)]
-    
-    # Process as they complete
-    for coro in asyncio.as_completed(tasks):
-        completed += 1
-        if completed % 5 == 0 or completed == total:
-            progress_bar.progress(completed / total)
-            status_text.text(f"⚡ Scanning... ({completed}/{total})")
-            
-        try:
-            result = await coro
-            if result:
-                all_signals.append(result)
-        except Exception:
-            pass
-            
-    return all_signals
-
-# ================================================================================
 # DISPLAY
 # ================================================================================
 def display_results(signals, scan_date, perf_stats=None):
@@ -454,12 +293,11 @@ def display_results(signals, scan_date, perf_stats=None):
         return
 
     if perf_stats:
-        speed_class = "speed-badge" if perf_stats['stocks_per_sec'] > 5 else ""
         st.markdown(f"""
         <div class="perf-card">
             ⚡ <b>Scan Performance:</b> {perf_stats['stocks_scanned']} stocks in {perf_stats['duration']:.1f}s 
-            | {perf_stats['signals_found']} signals | <span class="{speed_class}">{perf_stats['stocks_per_sec']:.1f} stocks/sec</span>
-            | Mode: {perf_stats.get('mode', 'Standard')}
+            | {perf_stats['signals_found']} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec
+            | {ScaleConfig.MAX_THREAD_WORKERS} threads × {ScaleConfig.TV_POOL_SIZE} TV connections
         </div>
         """, unsafe_allow_html=True)
 
@@ -500,8 +338,8 @@ def main():
     if not check_password():
         st.stop()
 
-    st.markdown('<div class="main-header">📈 Open Drive Fib Scanner 🚀 Ultimate</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Ultra-fast async scanning with hybrid data fetching</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">📈 Open Drive Fib Scanner</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Scans NSE stocks for Open=Low/High + Fib Retracement + EMA alignment</div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -549,11 +387,11 @@ def main():
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN — ASYNC ULTIMATE MODE
+    # HISTORICAL SCAN — PROVEN WORKING THREAD ARCHITECTURE
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
-        st.info(f"🔌 Initializing {ULTIMATE.TV_POOL_SIZE} TV Connections + Async HTTP Pool...")
+        st.info(f"🔌 Initializing {ScaleConfig.TV_POOL_SIZE} TV Connections...")
 
         tv_pool = get_tv_pool()
         strategy = OpenDriveFibStrategy()
@@ -570,27 +408,48 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-        # Run async scan
-        all_signals = asyncio.run(async_scan_all(
-            stock_list, scan_date, tolerance_pct, strategy, tv_pool,
-            progress_bar, status_text
-        ))
+        all_signals = []
+        total = len(stock_list)
+        completed = 0
+
+        def process_stock(task_data):
+            idx, sym, target_date = task_data
+            tv_inst = tv_pool[idx % len(tv_pool)]
+            time.sleep(random.uniform(0.02, 0.08))
+            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
+
+        # Submit ALL tasks at once — ThreadPoolExecutor manages true concurrency
+        with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
+            tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
+            futures = {executor.submit(process_stock, task): task for task in tasks}
+
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                if completed % 5 == 0 or completed == total:
+                    progress_bar.progress(completed / total)
+                    status_text.text(f"⚡ Scanning... ({completed}/{total})")
+
+                try:
+                    res = future.result()
+                    if res:
+                        all_signals.append(res)
+                except Exception:
+                    pass
 
         progress_container.empty()
 
         duration = time.time() - start_time
         perf_stats = {
-            'stocks_scanned': len(stock_list),
+            'stocks_scanned': total,
             'duration': duration,
             'signals_found': len(all_signals),
-            'stocks_per_sec': len(stock_list) / duration if duration > 0 else 0,
-            'mode': 'Async Hybrid (HTTP + WebSocket fallback)'
+            'stocks_per_sec': total / duration if duration > 0 else 0
         }
 
         display_results(all_signals, scan_date, perf_stats)
 
     # ---------------------------------------------------------
-    # REAL-TIME SCAN — Thread pool (async event loop issues in Streamlit)
+    # REAL-TIME SCAN
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 INITIALIZING...</span></div>', unsafe_allow_html=True)
@@ -611,16 +470,7 @@ def main():
             idx, sym, target_time = task_data
             tv_inst = tv_pool[idx % len(tv_pool)]
             time.sleep(random.uniform(0.02, 0.08))
-            
-            # Sync fetch
-            df_5 = strategy.get_historical_candles(tv_inst, sym, 5, is_live=True)
-            df_15 = strategy.get_historical_candles(tv_inst, sym, 15, is_live=True)
-            
-            if df_5.empty or df_15.empty:
-                return None
-                
-            target_date = target_time.date() if hasattr(target_time, 'date') else target_time
-            return strategy.scan_stock(df_5, df_15, target_date, tolerance_pct)
+            return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
 
         while True:
             all_signals = []
@@ -639,7 +489,7 @@ def main():
             total = len(stock_list)
             completed = 0
 
-            with ThreadPoolExecutor(max_workers=ULTIMATE.THREAD_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
                 tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
                 futures = {executor.submit(process_live, task): task for task in tasks}
 
@@ -652,7 +502,6 @@ def main():
                     try:
                         res = future.result()
                         if res:
-                            res['symbol'] = res['symbol'].replace('.NS', '')
                             all_signals.append(res)
                     except Exception:
                         pass
