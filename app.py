@@ -7,6 +7,8 @@ import random
 import warnings
 import logging
 import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from multiprocessing import cpu_count
 from tvDatafeed import TvDatafeed, Interval
 
 # Mute warnings
@@ -14,6 +16,26 @@ warnings.filterwarnings('ignore')
 logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# ================================================================================
+# SCALING CONFIGURATION — TUNE THESE
+# ================================================================================
+class ScaleConfig:
+    # Method 1: TV Pool Size (more instances = more connections)
+    TV_POOL_SIZE = 20           # Was 5. Try 15-25. Each uses ~50MB RAM.
+    
+    # Method 2: Thread Workers per process
+    MAX_THREAD_WORKERS = 10     # Threads per process
+    
+    # Method 3: Process Pool (true CPU parallelism)
+    # Set to None to use all CPU cores, or 1-4 for Streamlit Cloud
+    PROCESS_COUNT = min(4, cpu_count())  # 4 processes max
+    
+    # Method 6: Adaptive throttling
+    BATCH_SIZE = 25             # Stocks per batch
+    BATCH_DELAY = 0.3         # Seconds between batches
+    RETRY_ATTEMPTS = 2
+    BASE_DELAY = 0.1          # Min delay between requests
 
 # ================================================================================
 # PAGE UI & CSS
@@ -35,16 +57,28 @@ st.markdown("""
     .signal-card { padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid; }
     .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
     .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
+    .perf-card { background: #1e1e2e; padding: 0.8rem; border-radius: 6px; color: #a0a0b0; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
+# ================================================================================
+# TV POOL FACTORY — Can be called per-process
+# ================================================================================
+def create_tv_pool(size):
+    """Create a pool of TvDatafeed instances. Call once per process."""
+    pool = []
+    for i in range(size):
+        try:
+            pool.append(TvDatafeed())
+            time.sleep(0.8)  # Stagger connections
+        except Exception:
+            break  # Stop if we can't create more
+    return pool
+
 @st.cache_resource
 def get_tv_pool():
-    pool = []
-    for i in range(5):
-        pool.append(TvDatafeed())
-        time.sleep(1.5)
-    return pool
+    """Cached TV pool for main process."""
+    return create_tv_pool(ScaleConfig.TV_POOL_SIZE)
 
 # ================================================================================
 # SECURITY GATEWAY
@@ -70,7 +104,7 @@ def check_password():
         return True
 
 # ================================================================================
-# STRATEGY LOGIC — EXACT PINE SCRIPT MIRROR WITH [1] BAR GAP
+# STRATEGY LOGIC
 # ================================================================================
 class Config:
     EMA_FAST = 20
@@ -130,10 +164,6 @@ class OpenDriveFibStrategy:
         return is_uptrend, is_downtrend
 
     def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
-        """
-        EXACT Pine Script logic mirror with [1] bar gap enforcement.
-        EMAs calculated on FULL history before date filtering (proper warmup).
-        """
         try:
             df_5min = self.get_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
             df_15min = self.get_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
@@ -143,11 +173,11 @@ class OpenDriveFibStrategy:
 
             target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
 
-            # Calculate EMAs on FULL history first for proper warmup
+            # Calculate EMAs on FULL history
             df_15min['ema20'] = self.calculate_ema(df_15min, self.config.EMA_FAST)
             df_15min['ema50'] = self.calculate_ema(df_15min, self.config.EMA_SLOW)
 
-            # Filter to target date AND market hours (9:15 onwards)
+            # Filter to target date
             df_5min_today = df_5min[
                 (df_5min.index.date == target_date) & 
                 (df_5min.index.time >= pd.Timestamp('09:15').time())
@@ -160,17 +190,14 @@ class OpenDriveFibStrategy:
             if df_5min_today.empty or df_15min_today.empty:
                 return None
 
-            # Get first 5m candle (strictly 9:15-9:20)
             first_5m = df_5min_today.iloc[0]
             first5_open = float(first_5m['open'])
             first5_high = float(first_5m['high'])
             first5_low = float(first_5m['low'])
 
-            # ADAPTIVE TOLERANCE based on price
             price = first5_open if first5_open > 0 else 1.0
             tolerance = price * (tolerance_pct / 100)
 
-            # Check setup
             first5_is_buy_setup = abs(first5_open - first5_low) <= tolerance
             first5_is_sell_setup = abs(first5_open - first5_high) <= tolerance
 
@@ -179,34 +206,20 @@ class OpenDriveFibStrategy:
             if not first5_is_buy_setup and not first5_is_sell_setup:
                 return None
 
-            # === STATE VARIABLES ===
-            buy_swing_high = None
-            buy_fib_50 = None
-            buy_fib_618 = None
-            buy_impulse_done = False
-            buy_impulse_bar = -1
-            buy_retraced = False
-            buy_retrace_bar = -1
-            buy_signal_fired = False
+            # State variables
+            buy_swing_high = None; buy_fib_50 = None; buy_fib_618 = None
+            buy_impulse_done = False; buy_impulse_bar = -1
+            buy_retraced = False; buy_retrace_bar = -1; buy_signal_fired = False
 
-            sell_swing_low = None
-            sell_fib_50 = None
-            sell_fib_618 = None
-            sell_impulse_done = False
-            sell_impulse_bar = -1
-            sell_retraced = False
-            sell_retrace_bar = -1
-            sell_signal_fired = False
+            sell_swing_low = None; sell_fib_50 = None; sell_fib_618 = None
+            sell_impulse_done = False; sell_impulse_bar = -1
+            sell_retraced = False; sell_retrace_bar = -1; sell_signal_fired = False
 
-            buy_setup_invalid = False
-            sell_setup_invalid = False
-
+            buy_setup_invalid = False; sell_setup_invalid = False
             signal = None
 
-            # MAIN LOOP — DO NOT SKIP i=0
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
-
-                # === SETUP INVALIDATION — ONLY BEFORE IMPULSE COMPLETES ===
+                # Invalidation before impulse
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
@@ -215,109 +228,72 @@ class OpenDriveFibStrategy:
                     if row['high'] > first5_high:
                         sell_setup_invalid = True
 
-                # === BUY IMPULSE ===
+                # Buy impulse
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if buy_swing_high is None:
                         buy_swing_high = float(row['high'])
                     else:
                         buy_swing_high = max(buy_swing_high, float(row['high']))
-
-                    impulse_threshold = first5_high * (1 + self.config.MIN_IMPULSE_PCT / 100)
-                    if buy_swing_high >= impulse_threshold:
-                        buy_impulse_done = True
-                        buy_impulse_bar = i
+                    threshold = first5_high * (1 + self.config.MIN_IMPULSE_PCT / 100)
+                    if buy_swing_high >= threshold:
+                        buy_impulse_done = True; buy_impulse_bar = i
                         buy_fib_50 = buy_swing_high - self.config.FIB_LEVEL_1 * (buy_swing_high - first5_low)
                         buy_fib_618 = buy_swing_high - self.config.FIB_LEVEL_2 * (buy_swing_high - first5_low)
 
-                # === SELL IMPULSE ===
+                # Sell impulse
                 if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
                     if sell_swing_low is None:
                         sell_swing_low = float(row['low'])
                     else:
                         sell_swing_low = min(sell_swing_low, float(row['low']))
-
-                    impulse_threshold = first5_low * (1 - self.config.MIN_IMPULSE_PCT / 100)
-                    if sell_swing_low <= impulse_threshold:
-                        sell_impulse_done = True
-                        sell_impulse_bar = i
+                    threshold = first5_low * (1 - self.config.MIN_IMPULSE_PCT / 100)
+                    if sell_swing_low <= threshold:
+                        sell_impulse_done = True; sell_impulse_bar = i
                         sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
                         sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
 
-                # === BUY RETRACEMENT (bar AFTER impulse) ===
+                # Retracements
                 if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
                     if row['low'] <= buy_fib_50:
-                        buy_retraced = True
-                        buy_retrace_bar = i
+                        buy_retraced = True; buy_retrace_bar = i
 
-                # === SELL RETRACEMENT (bar AFTER impulse) ===
                 if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
                     if row['high'] >= sell_fib_50:
-                        sell_retraced = True
-                        sell_retrace_bar = i
+                        sell_retraced = True; sell_retrace_bar = i
 
-                # === BUY RECOVERY (bar AFTER retrace) ===
+                # Buy signal
                 if buy_retraced and not buy_signal_fired and i > buy_retrace_bar:
-                    is_green = row['close'] > row['open']
-                    if is_green and row['close'] > buy_fib_50:
+                    if row['close'] > row['open'] and row['close'] > buy_fib_50:
                         is_uptrend, _ = self.check_trend(df_15min_today.iloc[:i+1])
-                        price_above_emas = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
-
-                        if price_above_emas and is_uptrend:
-                            entry = float(row['close'])
-                            sl = float(row['low'])
+                        if (row['close'] > row['ema20']) and (row['close'] > row['ema50']) and is_uptrend:
+                            entry = float(row['close']); sl = float(row['low'])
                             target = entry + (entry - sl) * self.config.DEFAULT_TARGET_RR
-
                             signal = {
-                                'symbol': sym_clean,
-                                'date': target_date.strftime('%Y-%m-%d'),
-                                'direction': 'BUY',
-                                'setup_time': df_5min_today.index[0].strftime('%H:%M'),
-                                'signal_time': idx.strftime('%H:%M'),
-                                'entry_price': round(entry, 2),
-                                'stop_loss': round(sl, 2),
-                                'target': round(target, 2),
-                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
-                                'fib_50': round(buy_fib_50, 2),
-                                'fib_618': round(buy_fib_618, 2),
-                                'swing_high': round(buy_swing_high, 2),
-                                'ema20': round(float(row['ema20']), 2),
-                                'ema50': round(float(row['ema50']), 2),
-                                'trend': 'UP'
+                                'symbol': sym_clean, 'date': target_date.strftime('%Y-%m-%d'), 'direction': 'BUY',
+                                'setup_time': df_5min_today.index[0].strftime('%H:%M'), 'signal_time': idx.strftime('%H:%M'),
+                                'entry_price': round(entry, 2), 'stop_loss': round(sl, 2), 'target': round(target, 2),
+                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}", 'fib_50': round(buy_fib_50, 2),
+                                'fib_618': round(buy_fib_618, 2), 'swing_high': round(buy_swing_high, 2),
+                                'ema20': round(float(row['ema20']), 2), 'ema50': round(float(row['ema50']), 2), 'trend': 'UP'
                             }
-                            buy_signal_fired = True
-                            break
+                            buy_signal_fired = True; break
 
-                # === SELL RESUMPTION (bar AFTER retrace) ===
+                # Sell signal
                 if sell_retraced and not sell_signal_fired and i > sell_retrace_bar:
-                    is_red = row['close'] < row['open']
-                    if is_red and row['close'] < sell_fib_50:
+                    if row['close'] < row['open'] and row['close'] < sell_fib_50:
                         _, is_downtrend = self.check_trend(df_15min_today.iloc[:i+1])
-                        price_below_emas = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
-
-                        if price_below_emas and is_downtrend:
-                            entry = float(row['close'])
-                            sl = float(row['high'])
+                        if (row['close'] < row['ema20']) and (row['close'] < row['ema50']) and is_downtrend:
+                            entry = float(row['close']); sl = float(row['high'])
                             target = entry - (sl - entry) * self.config.DEFAULT_TARGET_RR
-
                             signal = {
-                                'symbol': sym_clean,
-                                'date': target_date.strftime('%Y-%m-%d'),
-                                'direction': 'SELL',
-                                'setup_time': df_5min_today.index[0].strftime('%H:%M'),
-                                'signal_time': idx.strftime('%H:%M'),
-                                'entry_price': round(entry, 2),
-                                'stop_loss': round(sl, 2),
-                                'target': round(target, 2),
-                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
-                                'fib_50': round(sell_fib_50, 2),
-                                'fib_618': round(sell_fib_618, 2),
-                                'swing_low': round(sell_swing_low, 2),
-                                'ema20': round(float(row['ema20']), 2),
-                                'ema50': round(float(row['ema50']), 2),
-                                'trend': 'DOWN'
+                                'symbol': sym_clean, 'date': target_date.strftime('%Y-%m-%d'), 'direction': 'SELL',
+                                'setup_time': df_5min_today.index[0].strftime('%H:%M'), 'signal_time': idx.strftime('%H:%M'),
+                                'entry_price': round(entry, 2), 'stop_loss': round(sl, 2), 'target': round(target, 2),
+                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}", 'fib_50': round(sell_fib_50, 2),
+                                'fib_618': round(sell_fib_618, 2), 'swing_low': round(sell_swing_low, 2),
+                                'ema20': round(float(row['ema20']), 2), 'ema50': round(float(row['ema50']), 2), 'trend': 'DOWN'
                             }
-                            sell_signal_fired = True
-                            break
+                            sell_signal_fired = True; break
 
             return signal
 
@@ -325,17 +301,66 @@ class OpenDriveFibStrategy:
             return None
 
 # ================================================================================
-# DISPLAY RESULTS
+# WORKER FUNCTION FOR PROCESS POOL
 # ================================================================================
-def display_results(signals, scan_date):
+def process_batch(batch_data):
+    """
+    Process a batch of stocks in a separate process.
+    Each process gets its own TV pool and strategy instance.
+    """
+    stock_batch, scan_date, tolerance_pct, config_values = batch_data
+    
+    # Each process creates its own TV pool (isolated connections)
+    tv_pool = create_tv_pool(ScaleConfig.TV_POOL_SIZE // ScaleConfig.PROCESS_COUNT + 1)
+    strategy = OpenDriveFibStrategy()
+    strategy.config.EMA_FAST = config_values['ema_fast']
+    strategy.config.EMA_SLOW = config_values['ema_slow']
+    strategy.config.FIB_LEVEL_1 = config_values['fib_50']
+    strategy.config.FIB_LEVEL_2 = config_values['fib_618']
+    strategy.config.MIN_IMPULSE_PCT = config_values['impulse_pct']
+    strategy.config.DEFAULT_TARGET_RR = config_values['rr']
+    
+    results = []
+    for idx, sym in enumerate(stock_batch):
+        tv_inst = tv_pool[idx % len(tv_pool)]
+        
+        # Adaptive retry
+        for attempt in range(ScaleConfig.RETRY_ATTEMPTS):
+            try:
+                time.sleep(ScaleConfig.BASE_DELAY + random.uniform(0, 0.1))
+                res = strategy.scan_stock(tv_inst, sym, scan_date, tolerance_pct)
+                if res:
+                    results.append(res)
+                break
+            except Exception:
+                if attempt == ScaleConfig.RETRY_ATTEMPTS - 1:
+                    break
+                time.sleep(0.5 * (attempt + 1))
+    
+    return results
+
+# ================================================================================
+# DISPLAY
+# ================================================================================
+def display_results(signals, scan_date, perf_stats=None):
     if not signals:
-        st.warning("⚠️ No signals found. No stocks met all Fibonacci retracement conditions.")
+        st.warning("⚠️ No signals found.")
         return
 
     df = pd.DataFrame([s for s in signals if s is not None])
     if df.empty:
-        st.warning("⚠️ No valid signals found.")
+        st.warning("⚠️ No valid signals.")
         return
+
+    # Performance stats
+    if perf_stats:
+        st.markdown(f"""
+        <div class="perf-card">
+            ⚡ <b>Scan Performance:</b> {perf_stats['stocks_scanned']} stocks in {perf_stats['duration']:.1f}s 
+            | {perf_stats['signals_found']} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec
+            | Using {ScaleConfig.PROCESS_COUNT} processes × {ScaleConfig.MAX_THREAD_WORKERS} threads
+        </div>
+        """, unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -419,62 +444,118 @@ def main():
         rr = st.number_input("Risk:Reward Ratio", value=2.0, min_value=1.0, max_value=5.0, step=0.5)
         tolerance_pct = st.number_input("Open=High/Low Tolerance (%)", value=0.01, min_value=0.001, max_value=1.0, step=0.001, format="%.3f")
 
+        # Scaling controls
+        st.markdown("---")
+        st.subheader("⚡ Performance Scaling")
+        use_processes = st.checkbox("Use Multi-Process Mode (faster, uses more RAM)", value=False)
+        st.caption(f"Default: {ScaleConfig.MAX_THREAD_WORKERS} threads. Multi-process: {ScaleConfig.PROCESS_COUNT} processes × {ScaleConfig.MAX_THREAD_WORKERS} threads = {ScaleConfig.PROCESS_COUNT * ScaleConfig.MAX_THREAD_WORKERS} concurrent")
+
         st.markdown("---")
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN
+    # HISTORICAL SCAN — WITH MULTI-PROCESS OPTION
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
-        st.info("🔌 Initializing 5-Pipe TradingView Connection...")
-        tv_pool = get_tv_pool()
+        start_time = time.time()
+        st.info(f"🔌 Initializing {'Multi-Process' if use_processes else 'Thread'} Pool...")
 
-        strategy = OpenDriveFibStrategy()
-        strategy.config.EMA_FAST = ema_fast
-        strategy.config.EMA_SLOW = ema_slow
-        strategy.config.FIB_LEVEL_1 = fib_50
-        strategy.config.FIB_LEVEL_2 = fib_618
-        strategy.config.MIN_IMPULSE_PCT = impulse_pct
-        strategy.config.DEFAULT_TARGET_RR = rr
+        config_values = {
+            'ema_fast': ema_fast, 'ema_slow': ema_slow,
+            'fib_50': fib_50, 'fib_618': fib_618,
+            'impulse_pct': impulse_pct, 'rr': rr
+        }
 
         progress_container = st.empty()
         with progress_container.container():
-            st.subheader("⏳ Scanning for Fib Retracement Signals...")
+            st.subheader("⏳ Scanning...")
             progress_bar = st.progress(0)
             status_text = st.empty()
 
         all_signals = []
         total = len(stock_list)
-        completed = 0
 
-        def process_stock(task_data):
-            idx, sym, target_date = task_data
-            tv_inst = tv_pool[idx % 5]
-            time.sleep(random.uniform(0.1, 0.4))
-            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
+        if use_processes and ScaleConfig.PROCESS_COUNT > 1:
+            # === MULTI-PROCESS MODE ===
+            # Split stocks into batches for each process
+            batch_size = max(1, len(stock_list) // ScaleConfig.PROCESS_COUNT)
+            batches = []
+            for i in range(0, len(stock_list), batch_size):
+                batch = stock_list[i:i + batch_size]
+                batches.append((batch, scan_date, tolerance_pct, config_values))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
-            futures = {executor.submit(process_stock, task): task for task in tasks}
+            completed_batches = 0
+            with ProcessPoolExecutor(max_workers=ScaleConfig.PROCESS_COUNT) as executor:
+                futures = {executor.submit(process_batch, batch): i for i, batch in enumerate(batches)}
+                
+                for future in concurrent.futures.as_completed(futures):
+                    completed_batches += 1
+                    progress_bar.progress(min(1.0, completed_batches / len(batches)))
+                    status_text.text(f"⚡ Process {completed_batches}/{len(batches)} complete...")
+                    
+                    try:
+                        batch_results = future.result()
+                        all_signals.extend(batch_results)
+                    except Exception as e:
+                        st.error(f"Process error: {e}")
 
-            for future in concurrent.futures.as_completed(futures):
-                completed += 1
-                if completed % 5 == 0 or completed == total:
-                    progress_bar.progress(completed / total)
-                    status_text.text(f"⚡ Scanning... ({completed}/{total})")
+        else:
+            # === THREAD-ONLY MODE (original, more stable) ===
+            tv_pool = get_tv_pool()
+            strategy = OpenDriveFibStrategy()
+            strategy.config.EMA_FAST = ema_fast
+            strategy.config.EMA_SLOW = ema_slow
+            strategy.config.FIB_LEVEL_1 = fib_50
+            strategy.config.FIB_LEVEL_2 = fib_618
+            strategy.config.MIN_IMPULSE_PCT = impulse_pct
+            strategy.config.DEFAULT_TARGET_RR = rr
 
-                try:
-                    res = future.result()
-                    if res:
-                        all_signals.append(res)
-                except Exception:
-                    pass
+            completed = 0
+
+            def process_stock(task_data):
+                idx, sym, target_date = task_data
+                tv_inst = tv_pool[idx % len(tv_pool)]
+                time.sleep(random.uniform(0.05, 0.2))
+                return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
+
+            with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
+                tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
+                
+                # Batch submission to avoid overwhelming
+                for batch_start in range(0, len(tasks), ScaleConfig.BATCH_SIZE):
+                    batch = tasks[batch_start:batch_start + ScaleConfig.BATCH_SIZE]
+                    futures = {executor.submit(process_stock, task): task for task in batch}
+
+                    for future in concurrent.futures.as_completed(futures):
+                        completed += 1
+                        if completed % 5 == 0 or completed == total:
+                            progress_bar.progress(completed / total)
+                            status_text.text(f"⚡ Scanning... ({completed}/{total})")
+
+                        try:
+                            res = future.result()
+                            if res:
+                                all_signals.append(res)
+                        except Exception:
+                            pass
+                    
+                    time.sleep(ScaleConfig.BATCH_DELAY)
 
         progress_container.empty()
-        display_results(all_signals, scan_date)
+
+        # Performance stats
+        duration = time.time() - start_time
+        perf_stats = {
+            'stocks_scanned': total,
+            'duration': duration,
+            'signals_found': len(all_signals),
+            'stocks_per_sec': total / duration if duration > 0 else 0
+        }
+
+        display_results(all_signals, scan_date, perf_stats)
 
     # ---------------------------------------------------------
-    # REAL-TIME SCAN
+    # REAL-TIME SCAN — Thread-only (safer for continuous)
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 INITIALIZING...</span></div>', unsafe_allow_html=True)
@@ -493,8 +574,8 @@ def main():
 
         def process_live(task_data):
             idx, sym, target_time = task_data
-            tv_inst = tv_pool[idx % 5]
-            time.sleep(random.uniform(0.1, 0.4))
+            tv_inst = tv_pool[idx % len(tv_pool)]
+            time.sleep(random.uniform(0.05, 0.15))
             return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
 
         while True:
@@ -514,22 +595,27 @@ def main():
             total = len(stock_list)
             completed = 0
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
                 tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
-                futures = {executor.submit(process_live, task): task for task in tasks}
+                
+                for batch_start in range(0, len(tasks), ScaleConfig.BATCH_SIZE):
+                    batch = tasks[batch_start:batch_start + ScaleConfig.BATCH_SIZE]
+                    futures = {executor.submit(process_live, task): task for task in batch}
 
-                for future in concurrent.futures.as_completed(futures):
-                    completed += 1
-                    if completed % 5 == 0 or completed == total:
-                        live_progress.progress(completed / total)
-                        live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
+                    for future in concurrent.futures.as_completed(futures):
+                        completed += 1
+                        if completed % 5 == 0 or completed == total:
+                            live_progress.progress(completed / total)
+                            live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
 
-                    try:
-                        res = future.result()
-                        if res:
-                            all_signals.append(res)
-                    except Exception:
-                        pass
+                        try:
+                            res = future.result()
+                            if res:
+                                all_signals.append(res)
+                        except Exception:
+                            pass
+                    
+                    time.sleep(ScaleConfig.BATCH_DELAY)
 
             progress_container.empty()
 
