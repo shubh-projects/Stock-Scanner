@@ -399,18 +399,18 @@ def main():
         st.subheader("📋 Stock List")
         input_method = st.radio("Input method:", ["Paste Symbols", "Use Default List"])
 
-        default_symbols = (
-            "HDFCBANK.NS
-            AXISBANK.NS
-            ICICIBANK.NS
-            KOTAKBANK.NS
-            RBLBANK.NS
-            FEDERALBANK.NS
-            BANDHANBANK.NS
-            AUBANK.NS
-            INDUSINDBANK.NS
-            IDFCFIRSTBANK.NS"
-            "SBIN.NS
+                default_symbols = """
+HDFCBANK.NS
+AXISBANK.NS
+ICICIBANK.NS
+KOTAKBANK.NS
+RBLBANK.NS
+FEDERALBANK.NS
+BANDHANBANK.NS
+AUBANK.NS
+INDUSINDBANK.NS
+IDFCFIRSTBANK.NS
+SBIN.NS
 BANKBARODA.NS
 CANBANK.NS
 PNB.NS
@@ -420,8 +420,7 @@ BAJAJFINSERV.NS
 BAJAJFINANCE.NS
 BSE.NS
 CDSL.NS
-"
-            "HDFCAMC.NS
+HDFCAMC.NS
 JIOFIN.NS
 LICHOUSING.NS
 LICI.NS
@@ -431,8 +430,7 @@ PFC.NS
 REC.NS
 SHRIRAMFINANCE.NS
 HCLTECH.NS
-"
-            "INFY.NS
+INFY.NS
 LTM.NS
 TCS.NS
 TECHM.NS
@@ -442,8 +440,7 @@ HINDZINC.NS
 NATIONALALUMINUM.NS
 NMDC.NS
 SAIL.NS
-"
-            "TATASTEEL.NS
+TATASTEEL.NS
 VEDL.NS
 DLF.NS
 OBEROIREALITY.NS
@@ -453,8 +450,7 @@ DABUR.NS
 HINDUNILVR.NS
 MARICO.NS
 TATACONSUMER.NS
-"
-            "BPCL.NS
+BPCL.NS
 COALINDIA.NS
 GAIL.NS
 HINDPETRO.NS
@@ -464,8 +460,7 @@ ONGC.NS
 RELIANCE.NS
 ASHOKLEY.NS
 BAJAJAUTO.NS
-"
-            "BHARATFORG.NS
+BHARATFORG.NS
 EICHER.NS
 EXIDE.NS
 HEROMOTO.NS
@@ -475,8 +470,7 @@ TMPV.NS
 TVSMOTOR.NS
 ASIANPAINT.NS
 CROMPTON.NS
-"
-            "HAVELLS.NS
+HAVELLS.NS
 TITAN.NS
 VOLTAS.NS
 APOLLOHOSPITAL.NS
@@ -486,8 +480,7 @@ DRREDDY.NS
 LAURUSLAB.NS
 LUPIN.NS
 SUNPHARMA.NS
-"
-            "SRF.NS
+SRF.NS
 SOLARINDUSTRY.NS
 AMBUJACEMENT.NS
 GRASIM.NS
@@ -497,8 +490,7 @@ ULTRATECH.NS
 ABB.NS
 ASTRAL.NS
 BEL.NS
-"
-            "BHEL.NS
+BHEL.NS
 CGPOWER.NS
 CUMMINS.NS
 HAL.NS
@@ -508,8 +500,7 @@ POWERINDIA.NS
 ETERNAL.NS
 INDHOTEL.NS
 NYKAA.NS
-"
-            "TRENT.NS
+TRENT.NS
 NTPC.NS
 TATAPOWER.NS
 POWERGRID.NS
@@ -518,16 +509,14 @@ DELHIVERY.NS
 CONCOR.NS
 GMR.NS
 INDIGO.NS
-BHARTIAIRTEL.NS"
-        )
+BHARTIAIRTEL.NS
+"""
 
         if input_method == "Paste Symbols":
             symbols_text = st.text_area("Enter symbols (one per line):", height=150, value=default_symbols)
-            stock_list = [line.strip() for line in symbols_text.split('
-') if line.strip()]
+            stock_list = [line.strip() for line in symbols_text.splitlines() if line.strip()]
         else:
-            stock_list = [line.strip() for line in default_symbols.split('
-') if line.strip()]
+            stock_list = [line.strip() for line in default_symbols.splitlines() if line.strip()]
 
         st.markdown(f"**{len(stock_list)} stocks loaded**")
         st.markdown("---")
