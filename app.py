@@ -9,6 +9,7 @@ import logging
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from tvDatafeed import TvDatafeed, Interval
+import threading
 
 # Mute warnings
 warnings.filterwarnings('ignore')
@@ -17,15 +18,16 @@ logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
-# PERFORMANCE CONFIGURATION — TUNE FOR SPEED
+# PERFORMANCE & RELIABILITY CONFIGURATION
 # ================================================================================
 class ScaleConfig:
-    """Optimized for 110 stocks in <10 seconds."""
-    TV_POOL_SIZE = 30           # Maximum safe TV connections (30 is the sweet spot)
-    MAX_THREAD_WORKERS = 25     # True concurrent threads (more = faster)
-    RETRY_ATTEMPTS = 2          # Quick retry on transient failures
-    BASE_DELAY = 0.02           # Minimal delay (20ms) between requests
-    CONNECTION_STAGGER = 0.3    # Fast TV instance creation (300ms)
+    """Optimized for 110 stocks in <25 seconds with consistent results."""
+    TV_POOL_SIZE = 25           # Slightly reduced for stability
+    MAX_THREAD_WORKERS = 15     # Reduced to prevent WebSocket corruption
+    RETRY_ATTEMPTS = 3          # More retries for reliability
+    BASE_DELAY = 0.05           # 50ms between requests (safer)
+    CONNECTION_STAGGER = 0.4    # 400ms per TV instance
+    MAX_RETRIES_EMPTY = 2       # Extra retries when data comes back empty
 
 # ================================================================================
 # PAGE UI & CSS
@@ -49,23 +51,40 @@ st.markdown("""
     .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
     .perf-card { background: #1e1e2e; padding: 0.8rem; border-radius: 6px; color: #a0a0b0; font-size: 0.85rem; }
     .speed-badge { background: linear-gradient(135deg, #00b09b 0%, #96c93d 100%); color: white; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
+    .warning-box { background: #fff3cd; border-left: 4px solid #ffc107; padding: 1rem; border-radius: 4px; color: #856404; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================================================================================
-# TV POOL — FAST INITIALIZATION, SHARED ACROSS ALL THREADS
+# TV POOL — THREAD-SAFE WITH LOCK PER INSTANCE
 # ================================================================================
+class TVPool:
+    """Thread-safe TV pool with per-instance locks to prevent concurrent access."""
+    def __init__(self, size):
+        self.pool = []
+        self.locks = []
+        for i in range(size):
+            try:
+                tv = TvDatafeed()
+                self.pool.append(tv)
+                self.locks.append(threading.Lock())
+                time.sleep(ScaleConfig.CONNECTION_STAGGER)
+            except Exception:
+                break
+        self.size = len(self.pool)
+        self._counter = 0
+        self._counter_lock = threading.Lock()
+
+    def acquire(self):
+        """Get next available TV instance with its lock."""
+        with self._counter_lock:
+            idx = self._counter % self.size
+            self._counter += 1
+        return idx, self.pool[idx], self.locks[idx]
+
 @st.cache_resource(show_spinner=False)
 def get_tv_pool():
-    """Create a large shared pool of TvDatafeed instances."""
-    pool = []
-    for i in range(ScaleConfig.TV_POOL_SIZE):
-        try:
-            pool.append(TvDatafeed())
-            time.sleep(ScaleConfig.CONNECTION_STAGGER)
-        except Exception:
-            break
-    return pool
+    return TVPool(ScaleConfig.TV_POOL_SIZE)
 
 # ================================================================================
 # SECURITY GATEWAY
@@ -328,6 +347,41 @@ class OpenDriveFibStrategy:
             return None
 
 # ================================================================================
+# RELIABLE WORKER WITH LOCK AND RETRY
+# ================================================================================
+def process_stock_safe(task_data, tv_pool, strategy, tolerance_pct):
+    """
+    Thread-safe stock processing with per-instance locking and retry logic.
+    This prevents WebSocket corruption when multiple threads hit the same TV instance.
+    """
+    idx, sym, target_date = task_data
+
+    # Acquire TV instance with its lock (prevents concurrent access)
+    tv_idx, tv_inst, tv_lock = tv_pool.acquire()
+
+    for attempt in range(ScaleConfig.RETRY_ATTEMPTS):
+        try:
+            # Lock during the entire API call sequence
+            with tv_lock:
+                time.sleep(ScaleConfig.BASE_DELAY)
+                result = strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
+
+            # If we got a signal, return it
+            if result is not None:
+                return result
+
+            # If no signal but data was fetched successfully, return None (valid result)
+            # The None means: setup checked, no signal found (not an error)
+            return None
+
+        except Exception as e:
+            if attempt == ScaleConfig.RETRY_ATTEMPTS - 1:
+                return None  # Final attempt failed
+            time.sleep(0.3 * (attempt + 1))  # Exponential backoff
+
+    return None
+
+# ================================================================================
 # DISPLAY RESULTS
 # ================================================================================
 def display_results(signals, scan_date, perf_stats=None):
@@ -398,7 +452,7 @@ def main():
         st.markdown("---")
         st.subheader("📋 Stock List")
         input_method = st.radio("Input method:", ["Paste Symbols", "Use Default List"])
-        
+
         default_symbols = """
 HDFCBANK.NS
 AXISBANK.NS
@@ -513,10 +567,10 @@ BHARTIAIRTEL.NS
 """
 
         if input_method == "Paste Symbols":
-            symbols_text = st.text_area("Enter symbols (one per line):", height=150, value=default_symbols)
-            stock_list = [line.strip() for line in symbols_text.splitlines() if line.strip()]
+            symbols_text = st.text_area("Enter symbols (one per line):", height=150, value=default_symbols.strip())
+            stock_list = [line.strip() for line in symbols_text.strip().splitlines() if line.strip()]
         else:
-            stock_list = [line.strip() for line in default_symbols.splitlines() if line.strip()]
+            stock_list = [line.strip() for line in default_symbols.strip().splitlines() if line.strip()]
 
         st.markdown(f"**{len(stock_list)} stocks loaded**")
         st.markdown("---")
@@ -534,12 +588,12 @@ BHARTIAIRTEL.NS
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN — OPTIMIZED FOR SPEED
+    # HISTORICAL SCAN — RELIABLE & FAST
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
 
-        # Initialize TV pool (cached, fast on subsequent runs)
+        # Initialize TV pool
         tv_pool = get_tv_pool()
 
         strategy = OpenDriveFibStrategy()
@@ -560,18 +614,15 @@ BHARTIAIRTEL.NS
         total = len(stock_list)
         completed = 0
 
-        def process_stock(task_data):
-            """Worker: fetch data and scan one stock."""
-            idx, sym, target_date = task_data
-            tv_inst = tv_pool[idx % len(tv_pool)]
-            time.sleep(ScaleConfig.BASE_DELAY + random.uniform(0, 0.03))
-            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
-
-        # CRITICAL: Submit ALL tasks at once — ThreadPoolExecutor queues them internally
-        # This is the key to true concurrency vs. batching
+        # Submit ALL tasks — ThreadPoolExecutor manages concurrency internally
         with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
             tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
-            futures = {executor.submit(process_stock, task): task for task in tasks}
+
+            # Use partial to pass shared objects
+            from functools import partial
+            worker = partial(process_stock_safe, tv_pool=tv_pool, strategy=strategy, tolerance_pct=tolerance_pct)
+
+            futures = {executor.submit(worker, task): task for task in tasks}
 
             for future in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -600,7 +651,7 @@ BHARTIAIRTEL.NS
         display_results(all_signals, scan_date, perf_stats)
 
     # ---------------------------------------------------------
-    # REAL-TIME SCAN — OPTIMIZED
+    # REAL-TIME SCAN
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 INITIALIZING...</span></div>', unsafe_allow_html=True)
@@ -617,11 +668,8 @@ BHARTIAIRTEL.NS
 
         live_container = st.empty()
 
-        def process_live(task_data):
-            idx, sym, target_time = task_data
-            tv_inst = tv_pool[idx % len(tv_pool)]
-            time.sleep(ScaleConfig.BASE_DELAY + random.uniform(0, 0.02))
-            return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
+        from functools import partial
+        worker = partial(process_stock_safe, tv_pool=tv_pool, strategy=strategy, tolerance_pct=tolerance_pct)
 
         while True:
             all_signals = []
@@ -642,7 +690,7 @@ BHARTIAIRTEL.NS
 
             with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
                 tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
-                futures = {executor.submit(process_live, task): task for task in tasks}
+                futures = {executor.submit(worker, task): task for task in tasks}
 
                 for future in concurrent.futures.as_completed(futures):
                     completed += 1
