@@ -2,4 +2,4 @@ streamlit
 pandas
 tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
 numpy
-nest-asyncio
+aiohttp
