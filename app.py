@@ -7,8 +7,7 @@ import random
 import warnings
 import logging
 import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from multiprocessing import cpu_count
+from concurrent.futures import ThreadPoolExecutor
 from tvDatafeed import TvDatafeed, Interval
 
 # Mute warnings
@@ -18,24 +17,13 @@ logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
-# SCALING CONFIGURATION — TUNE THESE
+# SCALING CONFIGURATION — EDIT THESE
 # ================================================================================
 class ScaleConfig:
-    # Method 1: TV Pool Size (more instances = more connections)
-    TV_POOL_SIZE = 20           # Was 5. Try 15-25. Each uses ~50MB RAM.
-    
-    # Method 2: Thread Workers per process
-    MAX_THREAD_WORKERS = 10     # Threads per process
-    
-    # Method 3: Process Pool (true CPU parallelism)
-    # Set to None to use all CPU cores, or 1-4 for Streamlit Cloud
-    PROCESS_COUNT = min(4, cpu_count())  # 4 processes max
-    
-    # Method 6: Adaptive throttling
-    BATCH_SIZE = 25             # Stocks per batch
-    BATCH_DELAY = 0.3         # Seconds between batches
+    TV_POOL_SIZE = 30           # More TV connections (30 is safe max)
+    MAX_THREAD_WORKERS = 20     # True concurrent threads
     RETRY_ATTEMPTS = 2
-    BASE_DELAY = 0.1          # Min delay between requests
+    BASE_DELAY = 0.05           # Minimal delay between requests
 
 # ================================================================================
 # PAGE UI & CSS
@@ -62,23 +50,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ================================================================================
-# TV POOL FACTORY — Can be called per-process
+# TV POOL — SINGLE SHARED POOL, ALL THREADS USE IT
 # ================================================================================
-def create_tv_pool(size):
-    """Create a pool of TvDatafeed instances. Call once per process."""
-    pool = []
-    for i in range(size):
-        try:
-            pool.append(TvDatafeed())
-            time.sleep(0.8)  # Stagger connections
-        except Exception:
-            break  # Stop if we can't create more
-    return pool
-
 @st.cache_resource
 def get_tv_pool():
-    """Cached TV pool for main process."""
-    return create_tv_pool(ScaleConfig.TV_POOL_SIZE)
+    """Create a large shared pool of TvDatafeed instances once."""
+    pool = []
+    for i in range(ScaleConfig.TV_POOL_SIZE):
+        try:
+            pool.append(TvDatafeed())
+            time.sleep(0.5)  # Fast stagger
+        except Exception:
+            break
+    return pool
 
 # ================================================================================
 # SECURITY GATEWAY
@@ -301,45 +285,6 @@ class OpenDriveFibStrategy:
             return None
 
 # ================================================================================
-# WORKER FUNCTION FOR PROCESS POOL
-# ================================================================================
-def process_batch(batch_data):
-    """
-    Process a batch of stocks in a separate process.
-    Each process gets its own TV pool and strategy instance.
-    """
-    stock_batch, scan_date, tolerance_pct, config_values = batch_data
-    
-    # Each process creates its own TV pool (isolated connections)
-    tv_pool = create_tv_pool(ScaleConfig.TV_POOL_SIZE // ScaleConfig.PROCESS_COUNT + 1)
-    strategy = OpenDriveFibStrategy()
-    strategy.config.EMA_FAST = config_values['ema_fast']
-    strategy.config.EMA_SLOW = config_values['ema_slow']
-    strategy.config.FIB_LEVEL_1 = config_values['fib_50']
-    strategy.config.FIB_LEVEL_2 = config_values['fib_618']
-    strategy.config.MIN_IMPULSE_PCT = config_values['impulse_pct']
-    strategy.config.DEFAULT_TARGET_RR = config_values['rr']
-    
-    results = []
-    for idx, sym in enumerate(stock_batch):
-        tv_inst = tv_pool[idx % len(tv_pool)]
-        
-        # Adaptive retry
-        for attempt in range(ScaleConfig.RETRY_ATTEMPTS):
-            try:
-                time.sleep(ScaleConfig.BASE_DELAY + random.uniform(0, 0.1))
-                res = strategy.scan_stock(tv_inst, sym, scan_date, tolerance_pct)
-                if res:
-                    results.append(res)
-                break
-            except Exception:
-                if attempt == ScaleConfig.RETRY_ATTEMPTS - 1:
-                    break
-                time.sleep(0.5 * (attempt + 1))
-    
-    return results
-
-# ================================================================================
 # DISPLAY
 # ================================================================================
 def display_results(signals, scan_date, perf_stats=None):
@@ -352,13 +297,12 @@ def display_results(signals, scan_date, perf_stats=None):
         st.warning("⚠️ No valid signals.")
         return
 
-    # Performance stats
     if perf_stats:
         st.markdown(f"""
         <div class="perf-card">
             ⚡ <b>Scan Performance:</b> {perf_stats['stocks_scanned']} stocks in {perf_stats['duration']:.1f}s 
             | {perf_stats['signals_found']} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec
-            | Using {ScaleConfig.PROCESS_COUNT} processes × {ScaleConfig.MAX_THREAD_WORKERS} threads
+            | {ScaleConfig.MAX_THREAD_WORKERS} threads × {ScaleConfig.TV_POOL_SIZE} TV connections
         </div>
         """, unsafe_allow_html=True)
 
@@ -444,27 +388,24 @@ def main():
         rr = st.number_input("Risk:Reward Ratio", value=2.0, min_value=1.0, max_value=5.0, step=0.5)
         tolerance_pct = st.number_input("Open=High/Low Tolerance (%)", value=0.01, min_value=0.001, max_value=1.0, step=0.001, format="%.3f")
 
-        # Scaling controls
-        st.markdown("---")
-        st.subheader("⚡ Performance Scaling")
-        use_processes = st.checkbox("Use Multi-Process Mode (faster, uses more RAM)", value=False)
-        st.caption(f"Default: {ScaleConfig.MAX_THREAD_WORKERS} threads. Multi-process: {ScaleConfig.PROCESS_COUNT} processes × {ScaleConfig.MAX_THREAD_WORKERS} threads = {ScaleConfig.PROCESS_COUNT * ScaleConfig.MAX_THREAD_WORKERS} concurrent")
-
         st.markdown("---")
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN — WITH MULTI-PROCESS OPTION
+    # HISTORICAL SCAN — ALL STOCKS FLOW THROUGH THREAD POOL
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
-        st.info(f"🔌 Initializing {'Multi-Process' if use_processes else 'Thread'} Pool...")
+        st.info(f"🔌 Initializing {ScaleConfig.TV_POOL_SIZE} TV Connections...")
 
-        config_values = {
-            'ema_fast': ema_fast, 'ema_slow': ema_slow,
-            'fib_50': fib_50, 'fib_618': fib_618,
-            'impulse_pct': impulse_pct, 'rr': rr
-        }
+        tv_pool = get_tv_pool()
+        strategy = OpenDriveFibStrategy()
+        strategy.config.EMA_FAST = ema_fast
+        strategy.config.EMA_SLOW = ema_slow
+        strategy.config.FIB_LEVEL_1 = fib_50
+        strategy.config.FIB_LEVEL_2 = fib_618
+        strategy.config.MIN_IMPULSE_PCT = impulse_pct
+        strategy.config.DEFAULT_TARGET_RR = rr
 
         progress_container = st.empty()
         with progress_container.container():
@@ -474,76 +415,34 @@ def main():
 
         all_signals = []
         total = len(stock_list)
+        completed = 0
 
-        if use_processes and ScaleConfig.PROCESS_COUNT > 1:
-            # === MULTI-PROCESS MODE ===
-            # Split stocks into batches for each process
-            batch_size = max(1, len(stock_list) // ScaleConfig.PROCESS_COUNT)
-            batches = []
-            for i in range(0, len(stock_list), batch_size):
-                batch = stock_list[i:i + batch_size]
-                batches.append((batch, scan_date, tolerance_pct, config_values))
+        def process_stock(task_data):
+            idx, sym, target_date = task_data
+            tv_inst = tv_pool[idx % len(tv_pool)]
+            time.sleep(random.uniform(0.02, 0.08))  # Very short stagger
+            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
 
-            completed_batches = 0
-            with ProcessPoolExecutor(max_workers=ScaleConfig.PROCESS_COUNT) as executor:
-                futures = {executor.submit(process_batch, batch): i for i, batch in enumerate(batches)}
-                
-                for future in concurrent.futures.as_completed(futures):
-                    completed_batches += 1
-                    progress_bar.progress(min(1.0, completed_batches / len(batches)))
-                    status_text.text(f"⚡ Process {completed_batches}/{len(batches)} complete...")
-                    
-                    try:
-                        batch_results = future.result()
-                        all_signals.extend(batch_results)
-                    except Exception as e:
-                        st.error(f"Process error: {e}")
+        # Submit ALL tasks at once — ThreadPoolExecutor manages true concurrency
+        with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
+            tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
+            futures = {executor.submit(process_stock, task): task for task in tasks}
 
-        else:
-            # === THREAD-ONLY MODE (original, more stable) ===
-            tv_pool = get_tv_pool()
-            strategy = OpenDriveFibStrategy()
-            strategy.config.EMA_FAST = ema_fast
-            strategy.config.EMA_SLOW = ema_slow
-            strategy.config.FIB_LEVEL_1 = fib_50
-            strategy.config.FIB_LEVEL_2 = fib_618
-            strategy.config.MIN_IMPULSE_PCT = impulse_pct
-            strategy.config.DEFAULT_TARGET_RR = rr
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                if completed % 5 == 0 or completed == total:
+                    progress_bar.progress(completed / total)
+                    status_text.text(f"⚡ Scanning... ({completed}/{total})")
 
-            completed = 0
-
-            def process_stock(task_data):
-                idx, sym, target_date = task_data
-                tv_inst = tv_pool[idx % len(tv_pool)]
-                time.sleep(random.uniform(0.05, 0.2))
-                return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
-
-            with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
-                tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
-                
-                # Batch submission to avoid overwhelming
-                for batch_start in range(0, len(tasks), ScaleConfig.BATCH_SIZE):
-                    batch = tasks[batch_start:batch_start + ScaleConfig.BATCH_SIZE]
-                    futures = {executor.submit(process_stock, task): task for task in batch}
-
-                    for future in concurrent.futures.as_completed(futures):
-                        completed += 1
-                        if completed % 5 == 0 or completed == total:
-                            progress_bar.progress(completed / total)
-                            status_text.text(f"⚡ Scanning... ({completed}/{total})")
-
-                        try:
-                            res = future.result()
-                            if res:
-                                all_signals.append(res)
-                        except Exception:
-                            pass
-                    
-                    time.sleep(ScaleConfig.BATCH_DELAY)
+                try:
+                    res = future.result()
+                    if res:
+                        all_signals.append(res)
+                except Exception:
+                    pass
 
         progress_container.empty()
 
-        # Performance stats
         duration = time.time() - start_time
         perf_stats = {
             'stocks_scanned': total,
@@ -555,7 +454,7 @@ def main():
         display_results(all_signals, scan_date, perf_stats)
 
     # ---------------------------------------------------------
-    # REAL-TIME SCAN — Thread-only (safer for continuous)
+    # REAL-TIME SCAN
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan":
         st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 INITIALIZING...</span></div>', unsafe_allow_html=True)
@@ -575,7 +474,7 @@ def main():
         def process_live(task_data):
             idx, sym, target_time = task_data
             tv_inst = tv_pool[idx % len(tv_pool)]
-            time.sleep(random.uniform(0.05, 0.15))
+            time.sleep(random.uniform(0.02, 0.08))
             return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
 
         while True:
@@ -597,25 +496,20 @@ def main():
 
             with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
                 tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
-                
-                for batch_start in range(0, len(tasks), ScaleConfig.BATCH_SIZE):
-                    batch = tasks[batch_start:batch_start + ScaleConfig.BATCH_SIZE]
-                    futures = {executor.submit(process_live, task): task for task in batch}
+                futures = {executor.submit(process_live, task): task for task in tasks}
 
-                    for future in concurrent.futures.as_completed(futures):
-                        completed += 1
-                        if completed % 5 == 0 or completed == total:
-                            live_progress.progress(completed / total)
-                            live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
+                for future in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    if completed % 5 == 0 or completed == total:
+                        live_progress.progress(completed / total)
+                        live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
 
-                        try:
-                            res = future.result()
-                            if res:
-                                all_signals.append(res)
-                        except Exception:
-                            pass
-                    
-                    time.sleep(ScaleConfig.BATCH_DELAY)
+                    try:
+                        res = future.result()
+                        if res:
+                            all_signals.append(res)
+                    except Exception:
+                        pass
 
             progress_container.empty()
 
