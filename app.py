@@ -17,12 +17,14 @@ logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
-# SCALING CONFIGURATION
+# SCALING CONFIGURATION — MAXIMUM SPEED
 # ================================================================================
 class ScaleConfig:
-    TV_POOL_SIZE = 30           # 30 TV connections
+    TV_POOL_SIZE = 20           # 20 stable connections (30 was too many, causes flakiness)
     MAX_THREAD_WORKERS = 25     # 25 concurrent threads
-    BASE_DELAY = 0.02           # Minimal delay
+    RETRY_ATTEMPTS = 3            # 3 retries per stock
+    BASE_DELAY = 0.03           # 30ms between requests
+    CONNECTION_TIMEOUT = 8      # Seconds to wait for TV data
 
 # ================================================================================
 # PAGE UI & CSS
@@ -45,22 +47,64 @@ st.markdown("""
     .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
     .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
     .perf-card { background: #1e1e2e; padding: 0.8rem; border-radius: 6px; color: #a0a0b0; font-size: 0.85rem; }
+    .error-card { background: #2d1f1f; padding: 0.6rem; border-radius: 4px; color: #ff6b6b; font-size: 0.8rem; margin: 0.3rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================================================================================
-# TV POOL
+# TV POOL WITH HEALTH CHECKING
 # ================================================================================
+class TVConnectionPool:
+    """Managed pool of TvDatafeed connections with health tracking."""
+    
+    def __init__(self, size):
+        self.pool = []
+        self.health_status = {}  # index -> bool (healthy)
+        self.failure_counts = {}  # index -> int
+        
+        for i in range(size):
+            try:
+                tv = TvDatafeed()
+                self.pool.append(tv)
+                self.health_status[i] = True
+                self.failure_counts[i] = 0
+                time.sleep(0.4)  # Stagger connections
+            except Exception:
+                break  # Stop if we can't create more
+        
+        self.size = len(self.pool)
+        st.info(f"✅ Initialized {self.size} TV connections")
+    
+    def get_healthy_instance(self, preferred_idx):
+        """Get a healthy TV instance, rotating if preferred is unhealthy."""
+        # Try preferred first
+        if self.health_status.get(preferred_idx % self.size, False):
+            return self.pool[preferred_idx % self.size], preferred_idx % self.size
+        
+        # Find any healthy instance
+        for i in range(self.size):
+            idx = (preferred_idx + i) % self.size
+            if self.health_status.get(idx, False):
+                return self.pool[idx], idx
+        
+        # All unhealthy — return first anyway (last resort)
+        return self.pool[0], 0
+    
+    def mark_failure(self, idx):
+        """Mark a connection as potentially unhealthy."""
+        self.failure_counts[idx] = self.failure_counts.get(idx, 0) + 1
+        if self.failure_counts[idx] >= 3:
+            self.health_status[idx] = False
+    
+    def mark_success(self, idx):
+        """Reset failure count on success."""
+        self.failure_counts[idx] = 0
+        self.health_status[idx] = True
+
 @st.cache_resource
 def get_tv_pool():
-    pool = []
-    for i in range(ScaleConfig.TV_POOL_SIZE):
-        try:
-            pool.append(TvDatafeed())
-            time.sleep(0.3)
-        except Exception:
-            break
-    return pool
+    """Cached TV pool with health management."""
+    return TVConnectionPool(ScaleConfig.TV_POOL_SIZE)
 
 # ================================================================================
 # SECURITY GATEWAY
@@ -101,34 +145,42 @@ class OpenDriveFibStrategy:
         self.config = Config()
 
     def get_historical_candles(self, tv_instance, symbol, resolution_minutes, is_live=False, days_back=100):
-        try:
-            if resolution_minutes == 5:
-                tv_interval = Interval.in_5_minute
-                bars_to_pull = 500 if is_live else (days_back * 75)
-            elif resolution_minutes == 10:
-                tv_interval = Interval.in_10_minute
-                bars_to_pull = 500 if is_live else (days_back * 50)
-            else:
-                tv_interval = Interval.in_15_minute
-                bars_to_pull = 500 if is_live else (days_back * 25)
+        """Fetch candles with internal retry."""
+        for attempt in range(3):
+            try:
+                if resolution_minutes == 5:
+                    tv_interval = Interval.in_5_minute
+                    bars_to_pull = 500 if is_live else (days_back * 75)
+                elif resolution_minutes == 10:
+                    tv_interval = Interval.in_10_minute
+                    bars_to_pull = 500 if is_live else (days_back * 50)
+                else:
+                    tv_interval = Interval.in_15_minute
+                    bars_to_pull = 500 if is_live else (days_back * 25)
 
-            formatted_symbol = symbol.replace('.NS', '')
-            df = tv_instance.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
+                formatted_symbol = symbol.replace('.NS', '')
+                df = tv_instance.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
 
-            if df is None or df.empty:
+                if df is not None and not df.empty:
+                    df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
+                    df.index = pd.to_datetime(df.index)
+                    if df.index.tz is None:
+                        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+                    else:
+                        df.index = df.index.tz_convert('Asia/Kolkata')
+                    return df
+                
+                # Empty result — retry
+                if attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                    
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
                 return pd.DataFrame()
-
-            df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
-            df.index = pd.to_datetime(df.index)
-
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-            else:
-                df.index = df.index.tz_convert('Asia/Kolkata')
-
-            return df
-        except Exception as e:
-            return pd.DataFrame()
+        
+        return pd.DataFrame()
 
     def calculate_ema(self, df, period):
         return df['close'].ewm(span=period, adjust=False).mean()
@@ -136,10 +188,13 @@ class OpenDriveFibStrategy:
     def check_trend(self, df):
         if len(df) < 2:
             return False, False
+
         ema20_now, ema20_prev = df['ema20'].iloc[-1], df['ema20'].iloc[-2]
         ema50_now, ema50_prev = df['ema50'].iloc[-1], df['ema50'].iloc[-2]
+
         is_uptrend = (ema20_now > ema50_now) and (ema20_now > ema20_prev) and (ema50_now > ema50_prev)
         is_downtrend = (ema20_now < ema50_now) and (ema20_now < ema20_prev) and (ema50_now < ema50_prev)
+
         return is_uptrend, is_downtrend
 
     def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
@@ -148,11 +203,11 @@ class OpenDriveFibStrategy:
             df_15min = self.get_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
 
             if df_5min.empty or df_15min.empty:
-                return None
+                return {"_error": True, "_reason": "empty_data", "symbol": symbol.replace('.NS', '')}
 
             target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
 
-            # Calculate EMAs on FULL history first
+            # Calculate EMAs on FULL history
             df_15min['ema20'] = self.calculate_ema(df_15min, self.config.EMA_FAST)
             df_15min['ema50'] = self.calculate_ema(df_15min, self.config.EMA_SLOW)
 
@@ -167,7 +222,7 @@ class OpenDriveFibStrategy:
             ].copy()
 
             if df_5min_today.empty or df_15min_today.empty:
-                return None
+                return {"_error": True, "_reason": "no_market_data", "symbol": symbol.replace('.NS', '')}
 
             first_5m = df_5min_today.iloc[0]
             first5_open = float(first_5m['open'])
@@ -183,7 +238,7 @@ class OpenDriveFibStrategy:
             sym_clean = symbol.replace('.NS', '')
 
             if not first5_is_buy_setup and not first5_is_sell_setup:
-                return None
+                return None  # Valid: no setup
 
             # State variables
             buy_swing_high = None; buy_fib_50 = None; buy_fib_618 = None
@@ -198,7 +253,7 @@ class OpenDriveFibStrategy:
             signal = None
 
             for i, (idx, row) in enumerate(df_15min_today.iterrows()):
-                # Invalidation ONLY before impulse completes
+                # Invalidation before impulse
                 if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
                     if row['low'] < first5_low:
                         buy_setup_invalid = True
@@ -231,11 +286,12 @@ class OpenDriveFibStrategy:
                         sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
                         sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
 
-                # Retracements
+                # Buy retrace
                 if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
                     if row['low'] <= buy_fib_50:
                         buy_retraced = True; buy_retrace_bar = i
 
+                # Sell retrace
                 if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
                     if row['high'] >= sell_fib_50:
                         sell_retraced = True; sell_retrace_bar = i
@@ -277,27 +333,77 @@ class OpenDriveFibStrategy:
             return signal
 
         except Exception as e:
-            return None
+            return {"_error": True, "_reason": str(e), "symbol": symbol.replace('.NS', '')}
+
+# ================================================================================
+# WORKER WITH RETRY AND CONNECTION ROTATION
+# ================================================================================
+def process_stock_robust(task_data):
+    """
+    Process a stock with aggressive retry and TV connection rotation.
+    Returns signal dict, None (no setup), or error dict.
+    """
+    idx, sym, target_date, tv_pool, strategy, tolerance_pct = task_data
+    
+    last_error = None
+    
+    for attempt in range(ScaleConfig.RETRY_ATTEMPTS):
+        # Get healthy TV instance, rotating on each attempt
+        tv_inst, tv_idx = tv_pool.get_healthy_instance(idx + attempt)
+        
+        try:
+            time.sleep(ScaleConfig.BASE_DELAY * attempt)  # Small backoff
+            
+            res = strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
+            
+            # Check if it's an error dict
+            if isinstance(res, dict) and res.get("_error"):
+                last_error = res.get("_reason")
+                tv_pool.mark_failure(tv_idx)
+                continue  # Retry with different connection
+            
+            # Success — mark connection healthy
+            tv_pool.mark_success(tv_idx)
+            return res  # Either signal dict or None (valid no-setup)
+            
+        except Exception as e:
+            last_error = str(e)
+            tv_pool.mark_failure(tv_idx)
+            if attempt < ScaleConfig.RETRY_ATTEMPTS - 1:
+                time.sleep(0.2 * (attempt + 1))
+    
+    # All retries exhausted
+    return None
 
 # ================================================================================
 # DISPLAY
 # ================================================================================
-def display_results(signals, scan_date, perf_stats=None):
-    if not signals:
+def display_results(signals, scan_date, perf_stats=None, errors=None):
+    # Separate valid signals from errors
+    valid_signals = [s for s in signals if s is not None and not isinstance(s, dict) or (isinstance(s, dict) and not s.get("_error"))]
+    error_list = [s for s in signals if isinstance(s, dict) and s.get("_error")]
+    
+    if not valid_signals:
         st.warning("⚠️ No signals found.")
+        if errors:
+            with st.expander("📊 Scan Errors"):
+                for e in errors[:10]:
+                    st.markdown(f'<div class="error-card">{e["symbol"]}: {e.get("_reason", "unknown")}</div>', unsafe_allow_html=True)
         return
 
-    df = pd.DataFrame([s for s in signals if s is not None])
+    df = pd.DataFrame(valid_signals)
     if df.empty:
         st.warning("⚠️ No valid signals.")
         return
 
+    # Performance stats
     if perf_stats:
         st.markdown(f"""
         <div class="perf-card">
             ⚡ <b>Scan Performance:</b> {perf_stats['stocks_scanned']} stocks in {perf_stats['duration']:.1f}s 
-            | {perf_stats['signals_found']} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec
+            | {len(valid_signals)} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec
             | {ScaleConfig.MAX_THREAD_WORKERS} threads × {ScaleConfig.TV_POOL_SIZE} TV connections
+            | {len(error_list)} data errors (auto-retried)
         </div>
         """, unsafe_allow_html=True)
 
@@ -330,6 +436,12 @@ def display_results(signals, scan_date, perf_stats=None):
 
     with st.expander("📊 Export Data"):
         st.dataframe(df, hide_index=True, use_container_width=True)
+    
+    # Show errors if any
+    if error_list:
+        with st.expander(f"⚠️ Data Errors ({len(error_list)} stocks failed after retries)"):
+            for e in error_list[:20]:
+                st.markdown(f'<div class="error-card">{e["symbol"]}: {e.get("_reason", "unknown")}</div>', unsafe_allow_html=True)
 
 # ================================================================================
 # MAIN APP
@@ -387,13 +499,14 @@ def main():
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN — PROVEN WORKING THREAD ARCHITECTURE
+    # HISTORICAL SCAN — MAXIMUM SPEED
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
-        st.info(f"🔌 Initializing {ScaleConfig.TV_POOL_SIZE} TV Connections...")
-
+        
+        # Initialize TV pool
         tv_pool = get_tv_pool()
+        
         strategy = OpenDriveFibStrategy()
         strategy.config.EMA_FAST = ema_fast
         strategy.config.EMA_SLOW = ema_slow
@@ -408,20 +521,14 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-        all_signals = []
+        all_results = []
         total = len(stock_list)
         completed = 0
 
-        def process_stock(task_data):
-            idx, sym, target_date = task_data
-            tv_inst = tv_pool[idx % len(tv_pool)]
-            time.sleep(random.uniform(0.02, 0.08))
-            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
-
-        # Submit ALL tasks at once — ThreadPoolExecutor manages true concurrency
+        # Submit ALL tasks at once — ThreadPoolExecutor manages concurrency
         with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
-            tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
-            futures = {executor.submit(process_stock, task): task for task in tasks}
+            tasks = [(i, sym, scan_date, tv_pool, strategy, tolerance_pct) for i, sym in enumerate(stock_list)]
+            futures = {executor.submit(process_stock_robust, task): task for task in tasks}
 
             for future in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -430,23 +537,26 @@ def main():
                     status_text.text(f"⚡ Scanning... ({completed}/{total})")
 
                 try:
-                    res = future.result()
-                    if res:
-                        all_signals.append(res)
+                    res = future.result(timeout=ScaleConfig.CONNECTION_TIMEOUT)
+                    all_results.append(res)
                 except Exception:
-                    pass
+                    all_results.append(None)
 
         progress_container.empty()
 
+        # Performance stats
         duration = time.time() - start_time
+        valid_signals = [r for r in all_results if r is not None and not (isinstance(r, dict) and r.get("_error"))]
+        errors = [r for r in all_results if isinstance(r, dict) and r.get("_error")]
+        
         perf_stats = {
             'stocks_scanned': total,
             'duration': duration,
-            'signals_found': len(all_signals),
+            'signals_found': len(valid_signals),
             'stocks_per_sec': total / duration if duration > 0 else 0
         }
 
-        display_results(all_signals, scan_date, perf_stats)
+        display_results(all_results, scan_date, perf_stats, errors)
 
     # ---------------------------------------------------------
     # REAL-TIME SCAN
@@ -466,14 +576,8 @@ def main():
 
         live_container = st.empty()
 
-        def process_live(task_data):
-            idx, sym, target_time = task_data
-            tv_inst = tv_pool[idx % len(tv_pool)]
-            time.sleep(random.uniform(0.02, 0.08))
-            return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
-
         while True:
-            all_signals = []
+            all_results = []
             live_datetime = datetime.now(IST)
             current_time = live_datetime.time()
 
@@ -490,8 +594,8 @@ def main():
             completed = 0
 
             with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
-                tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
-                futures = {executor.submit(process_live, task): task for task in tasks}
+                tasks = [(i, sym, live_datetime, tv_pool, strategy, tolerance_pct) for i, sym in enumerate(stock_list)]
+                futures = {executor.submit(process_stock_robust, task): task for task in tasks}
 
                 for future in concurrent.futures.as_completed(futures):
                     completed += 1
@@ -500,18 +604,19 @@ def main():
                         live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
 
                     try:
-                        res = future.result()
-                        if res:
-                            all_signals.append(res)
+                        res = future.result(timeout=ScaleConfig.CONNECTION_TIMEOUT)
+                        all_results.append(res)
                     except Exception:
-                        pass
+                        all_results.append(None)
 
             progress_container.empty()
 
+            valid_signals = [r for r in all_results if r is not None and not (isinstance(r, dict) and r.get("_error"))]
+            
             with live_container.container():
                 market_status = "🟢 Market Open" if is_market_open else "🔴 Market Closed"
                 st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | {market_status}")
-                display_results(all_signals, live_datetime)
+                display_results(all_results, live_datetime)
 
             time.sleep(60 if not is_market_open else 5)
 
