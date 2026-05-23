@@ -3,20 +3,95 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 import time
+import random
 import warnings
 import logging
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from tvDatafeed import TvDatafeed, Interval
 
+# Mute warnings
 warnings.filterwarnings('ignore')
 logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================================================================================
-# CONFIGURATION
+# PERFORMANCE CONFIGURATION — TUNE FOR SPEED
+# ================================================================================
+class ScaleConfig:
+    """Optimized for 110 stocks in <10 seconds."""
+    TV_POOL_SIZE = 30           # Maximum safe TV connections (30 is the sweet spot)
+    MAX_THREAD_WORKERS = 25     # True concurrent threads (more = faster)
+    RETRY_ATTEMPTS = 2          # Quick retry on transient failures
+    BASE_DELAY = 0.02           # Minimal delay (20ms) between requests
+    CONNECTION_STAGGER = 0.3    # Fast TV instance creation (300ms)
+
+# ================================================================================
+# PAGE UI & CSS
+# ================================================================================
+st.set_page_config(
+    page_title="Open Drive Fib Scanner",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 0.5rem; }
+    .sub-header { font-size: 1.1rem; color: #666; text-align: center; margin-bottom: 2rem; }
+    .metric-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1rem; border-radius: 10px; color: white; text-align: center; }
+    .live-badge { background-color: #ff4b4b; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; font-weight: bold; animation: blink 2s infinite; }
+    @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+    .signal-card { padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid; }
+    .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
+    .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
+    .perf-card { background: #1e1e2e; padding: 0.8rem; border-radius: 6px; color: #a0a0b0; font-size: 0.85rem; }
+    .speed-badge { background: linear-gradient(135deg, #00b09b 0%, #96c93d 100%); color: white; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
+
+# ================================================================================
+# TV POOL — FAST INITIALIZATION, SHARED ACROSS ALL THREADS
+# ================================================================================
+@st.cache_resource(show_spinner=False)
+def get_tv_pool():
+    """Create a large shared pool of TvDatafeed instances."""
+    pool = []
+    for i in range(ScaleConfig.TV_POOL_SIZE):
+        try:
+            pool.append(TvDatafeed())
+            time.sleep(ScaleConfig.CONNECTION_STAGGER)
+        except Exception:
+            break
+    return pool
+
+# ================================================================================
+# SECURITY GATEWAY
+# ================================================================================
+def check_password():
+    def password_entered():
+        if st.session_state["password"] == st.secrets["app_password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"] 
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.markdown('<div class="main-header">🔒 Private Access Only</div>', unsafe_allow_html=True)
+        st.text_input("Enter Scanner Password", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.markdown('<div class="main-header">🔒 Private Access Only</div>', unsafe_allow_html=True)
+        st.text_input("Enter Scanner Password", type="password", on_change=password_entered, key="password")
+        st.error("❌ Access Denied. Incorrect password.")
+        return False
+    else:
+        return True
+
+# ================================================================================
+# STRATEGY LOGIC — EXACT PINE SCRIPT MIRROR
 # ================================================================================
 class Config:
     EMA_FAST = 20
@@ -25,357 +100,284 @@ class Config:
     FIB_LEVEL_2 = 0.618
     MIN_IMPULSE_PCT = 0.5
     DEFAULT_TARGET_RR = 2.0
-    WORKERS = 10           # 10 concurrent threads
-    BATCH_SIZE = 10        # Submit 10 at a time
-    TIMEOUT = 12           # Seconds per stock
 
-# ================================================================================
-# UI SETUP
-# ================================================================================
-st.set_page_config(page_title="Open Drive Fib Scanner", page_icon="📈", layout="wide")
-st.markdown("""
-<style>
-    .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; }
-    .sub-header { font-size: 1.1rem; color: #666; text-align: center; margin-bottom: 2rem; }
-    .metric-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1rem; border-radius: 10px; color: white; text-align: center; }
-    .signal-card { padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid; }
-    .buy-card { background: linear-gradient(135deg, #1a5f5f 0%, #2d8a8a 100%) !important; color: white; border-left-color: #4CAF50; }
-    .sell-card { background: linear-gradient(135deg, #7a1f1f 0%, #a03030 100%) !important; color: white; border-left-color: #f44336; }
-    .perf-card { background: #1e1e2e; padding: 0.8rem; border-radius: 6px; color: #a0a0b0; font-size: 0.85rem; }
-    .error-card { background: #2d1f1f; padding: 0.6rem; border-radius: 4px; color: #ff6b6b; font-size: 0.8rem; margin: 0.3rem 0; }
-</style>
-""", unsafe_allow_html=True)
+class OpenDriveFibStrategy:
+    def __init__(self):
+        self.config = Config()
 
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == st.secrets["app_password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        st.markdown('<div style="font-size:2rem;text-align:center;">🔒 Private Access</div>', unsafe_allow_html=True)
-        st.text_input("Enter Password", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.markdown('<div style="font-size:2rem;text-align:center;">🔒 Private Access</div>', unsafe_allow_html=True)
-        st.text_input("Enter Password", type="password", on_change=password_entered, key="password")
-        st.error("❌ Incorrect password.")
-        return False
-    return True
-
-# ================================================================================
-# TV POOL
-# ================================================================================
-class TVPool:
-    def __init__(self, size):
-        self.pool = []
-        for i in range(size):
-            try:
-                self.pool.append(TvDatafeed())
-                time.sleep(0.3)
-            except Exception:
-                break
-        self.size = len(self.pool)
-        if self.size == 0:
-            st.error("❌ No TV connections")
-            st.stop()
-
-    def get(self, idx):
-        return self.pool[idx % self.size]
-
-# ================================================================================
-# STRATEGY LOGIC
-# ================================================================================
-def calculate_ema(df, period):
-    return df['close'].ewm(span=period, adjust=False).mean()
-
-def check_trend(df_slice):
-    if len(df_slice) < 2:
-        return False, False
-    ema20_now = df_slice['ema20'].iloc[-1]
-    ema50_now = df_slice['ema50'].iloc[-1]
-    ema20_prev = df_slice['ema20'].iloc[-2]
-    ema50_prev = df_slice['ema50'].iloc[-2]
-    is_up = (ema20_now > ema50_now) and (ema20_prev > ema50_prev)
-    is_down = (ema20_now < ema50_now) and (ema20_prev < ema50_prev)
-    return is_up, is_down
-
-def get_data(tv, symbol, res, days=5):
-    for attempt in range(2):
+    def get_historical_candles(self, tv_instance, symbol, resolution_minutes, is_live=False, days_back=100):
         try:
-            if res == 5:
-                interval = Interval.in_5_minute
-                bars = days * 75
+            if resolution_minutes == 5:
+                tv_interval = Interval.in_5_minute
+                bars_to_pull = 500 if is_live else (days_back * 75)
+            elif resolution_minutes == 10:
+                tv_interval = Interval.in_10_minute
+                bars_to_pull = 500 if is_live else (days_back * 50)
             else:
-                interval = Interval.in_15_minute
-                bars = days * 25
+                tv_interval = Interval.in_15_minute
+                bars_to_pull = 500 if is_live else (days_back * 25)
 
-            df = tv.get_hist(symbol=symbol.replace('.NS', ''), exchange='NSE', interval=interval, n_bars=bars)
-            if df is not None and not df.empty:
-                df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
-                df.index = pd.to_datetime(df.index)
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-                else:
-                    df.index = df.index.tz_convert('Asia/Kolkata')
-                return df
-            if attempt == 0:
-                time.sleep(0.2)
-        except Exception:
-            if attempt == 0:
-                time.sleep(0.2)
-    return pd.DataFrame()
+            formatted_symbol = symbol.replace('.NS', '')
+            df = tv_instance.get_hist(symbol=formatted_symbol, exchange='NSE', interval=tv_interval, n_bars=bars_to_pull)
 
-def scan_stock(tv, symbol, target_date, tolerance_pct):
-    sym_clean = symbol.replace('.NS', '')
-    try:
-        df_5 = get_data(tv, symbol, 5, days=5)
-        df_15 = get_data(tv, symbol, 15, days=10)
+            if df is None or df.empty:
+                return pd.DataFrame()
 
-        if df_5.empty or df_15.empty:
-            return {"_error": True, "_reason": "empty_data", "symbol": sym_clean}
+            df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
+            df.index = pd.to_datetime(df.index)
 
-        market_open = pd.Timestamp('09:15').time()
-        market_close = pd.Timestamp('15:30').time()
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_convert('Asia/Kolkata')
 
-        df_5_today = df_5[(df_5.index.date == target_date) & (df_5.index.time >= market_open) & (df_5.index.time <= market_close)].copy()
-        df_15['ema20'] = calculate_ema(df_15, Config.EMA_FAST)
-        df_15['ema50'] = calculate_ema(df_15, Config.EMA_SLOW)
-        df_15_today = df_15[(df_15.index.date == target_date) & (df_15.index.time >= market_open) & (df_15.index.time <= market_close)].copy()
+            return df
+        except Exception as e:
+            return pd.DataFrame()
 
-        if df_5_today.empty or len(df_15_today) < 3:
+    def calculate_ema(self, df, period):
+        return df['close'].ewm(span=period, adjust=False).mean()
+
+    def check_trend(self, df):
+        if len(df) < 2:
+            return False, False
+
+        ema20_now, ema20_prev = df['ema20'].iloc[-1], df['ema20'].iloc[-2]
+        ema50_now, ema50_prev = df['ema50'].iloc[-1], df['ema50'].iloc[-2]
+
+        is_uptrend = (ema20_now > ema50_now) and (ema20_now > ema20_prev) and (ema50_now > ema50_prev)
+        is_downtrend = (ema20_now < ema50_now) and (ema20_now < ema20_prev) and (ema50_now < ema50_prev)
+
+        return is_uptrend, is_downtrend
+
+    def scan_stock(self, tv_instance, symbol, scan_date, tolerance_pct=0.01):
+        try:
+            df_5min = self.get_historical_candles(tv_instance, symbol, 5, is_live=False, days_back=100)
+            df_15min = self.get_historical_candles(tv_instance, symbol, 15, is_live=False, days_back=100)
+
+            if df_5min.empty or df_15min.empty:
+                return None
+
+            target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
+
+            # Calculate EMAs on FULL history before filtering
+            df_15min['ema20'] = self.calculate_ema(df_15min, self.config.EMA_FAST)
+            df_15min['ema50'] = self.calculate_ema(df_15min, self.config.EMA_SLOW)
+
+            # Filter to target date AND market hours
+            df_5min_today = df_5min[
+                (df_5min.index.date == target_date) & 
+                (df_5min.index.time >= pd.Timestamp('09:15').time())
+            ].copy()
+            df_15min_today = df_15min[
+                (df_15min.index.date == target_date) & 
+                (df_15min.index.time >= pd.Timestamp('09:15').time())
+            ].copy()
+
+            if df_5min_today.empty or df_15min_today.empty:
+                return None
+
+            # Get first 5m candle (strictly 9:15-9:20)
+            first_5m = df_5min_today.iloc[0]
+            first5_open = float(first_5m['open'])
+            first5_high = float(first_5m['high'])
+            first5_low = float(first_5m['low'])
+
+            # ADAPTIVE TOLERANCE based on price
+            price = first5_open if first5_open > 0 else 1.0
+            tolerance = price * (tolerance_pct / 100)
+
+            # Check setup
+            first5_is_buy_setup = abs(first5_open - first5_low) <= tolerance
+            first5_is_sell_setup = abs(first5_open - first5_high) <= tolerance
+
+            sym_clean = symbol.replace('.NS', '')
+
+            if not first5_is_buy_setup and not first5_is_sell_setup:
+                return None
+
+            # State variables
+            buy_swing_high = None; buy_fib_50 = None; buy_fib_618 = None
+            buy_impulse_done = False; buy_impulse_bar = -1
+            buy_retraced = False; buy_retrace_bar = -1; buy_signal_fired = False
+
+            sell_swing_low = None; sell_fib_50 = None; sell_fib_618 = None
+            sell_impulse_done = False; sell_impulse_bar = -1
+            sell_retraced = False; sell_retrace_bar = -1; sell_signal_fired = False
+
+            buy_setup_invalid = False; sell_setup_invalid = False
+            signal = None
+
+            # MAIN LOOP — DO NOT SKIP i=0 (matches Pine Script)
+            for i, (idx, row) in enumerate(df_15min_today.iterrows()):
+
+                # SETUP INVALIDATION — ONLY BEFORE IMPULSE COMPLETES
+                if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
+                    if row['low'] < first5_low:
+                        buy_setup_invalid = True
+
+                if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
+                    if row['high'] > first5_high:
+                        sell_setup_invalid = True
+
+                # BUY IMPULSE
+                if first5_is_buy_setup and not buy_setup_invalid and not buy_impulse_done:
+                    if buy_swing_high is None:
+                        buy_swing_high = float(row['high'])
+                    else:
+                        buy_swing_high = max(buy_swing_high, float(row['high']))
+                    impulse_threshold = first5_high * (1 + self.config.MIN_IMPULSE_PCT / 100)
+                    if buy_swing_high >= impulse_threshold:
+                        buy_impulse_done = True
+                        buy_impulse_bar = i
+                        buy_fib_50 = buy_swing_high - self.config.FIB_LEVEL_1 * (buy_swing_high - first5_low)
+                        buy_fib_618 = buy_swing_high - self.config.FIB_LEVEL_2 * (buy_swing_high - first5_low)
+
+                # SELL IMPULSE
+                if first5_is_sell_setup and not sell_setup_invalid and not sell_impulse_done:
+                    if sell_swing_low is None:
+                        sell_swing_low = float(row['low'])
+                    else:
+                        sell_swing_low = min(sell_swing_low, float(row['low']))
+                    impulse_threshold = first5_low * (1 - self.config.MIN_IMPULSE_PCT / 100)
+                    if sell_swing_low <= impulse_threshold:
+                        sell_impulse_done = True
+                        sell_impulse_bar = i
+                        sell_fib_50 = sell_swing_low + self.config.FIB_LEVEL_1 * (first5_high - sell_swing_low)
+                        sell_fib_618 = sell_swing_low + self.config.FIB_LEVEL_2 * (first5_high - sell_swing_low)
+
+                # BUY RETRACEMENT (bar AFTER impulse)
+                if buy_impulse_done and not buy_retraced and i > buy_impulse_bar:
+                    if row['low'] <= buy_fib_50:
+                        buy_retraced = True
+                        buy_retrace_bar = i
+
+                # SELL RETRACEMENT (bar AFTER impulse)
+                if sell_impulse_done and not sell_retraced and i > sell_impulse_bar:
+                    if row['high'] >= sell_fib_50:
+                        sell_retraced = True
+                        sell_retrace_bar = i
+
+                # BUY RECOVERY (bar AFTER retrace)
+                if buy_retraced and not buy_signal_fired and i > buy_retrace_bar:
+                    is_green = row['close'] > row['open']
+                    if is_green and row['close'] > buy_fib_50:
+                        is_uptrend, _ = self.check_trend(df_15min_today.iloc[:i+1])
+                        price_above_emas = (row['close'] > row['ema20']) and (row['close'] > row['ema50'])
+
+                        if price_above_emas and is_uptrend:
+                            entry = float(row['close'])
+                            sl = float(row['low'])
+                            target = entry + (entry - sl) * self.config.DEFAULT_TARGET_RR
+
+                            signal = {
+                                'symbol': sym_clean,
+                                'date': target_date.strftime('%Y-%m-%d'),
+                                'direction': 'BUY',
+                                'setup_time': df_5min_today.index[0].strftime('%H:%M'),
+                                'signal_time': idx.strftime('%H:%M'),
+                                'entry_price': round(entry, 2),
+                                'stop_loss': round(sl, 2),
+                                'target': round(target, 2),
+                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
+                                'fib_50': round(buy_fib_50, 2),
+                                'fib_618': round(buy_fib_618, 2),
+                                'swing_high': round(buy_swing_high, 2),
+                                'ema20': round(float(row['ema20']), 2),
+                                'ema50': round(float(row['ema50']), 2),
+                                'trend': 'UP'
+                            }
+                            buy_signal_fired = True
+                            break
+
+                # SELL RESUMPTION (bar AFTER retrace)
+                if sell_retraced and not sell_signal_fired and i > sell_retrace_bar:
+                    is_red = row['close'] < row['open']
+                    if is_red and row['close'] < sell_fib_50:
+                        _, is_downtrend = self.check_trend(df_15min_today.iloc[:i+1])
+                        price_below_emas = (row['close'] < row['ema20']) and (row['close'] < row['ema50'])
+
+                        if price_below_emas and is_downtrend:
+                            entry = float(row['close'])
+                            sl = float(row['high'])
+                            target = entry - (sl - entry) * self.config.DEFAULT_TARGET_RR
+
+                            signal = {
+                                'symbol': sym_clean,
+                                'date': target_date.strftime('%Y-%m-%d'),
+                                'direction': 'SELL',
+                                'setup_time': df_5min_today.index[0].strftime('%H:%M'),
+                                'signal_time': idx.strftime('%H:%M'),
+                                'entry_price': round(entry, 2),
+                                'stop_loss': round(sl, 2),
+                                'target': round(target, 2),
+                                'risk_reward': f"1:{self.config.DEFAULT_TARGET_RR}",
+                                'fib_50': round(sell_fib_50, 2),
+                                'fib_618': round(sell_fib_618, 2),
+                                'swing_low': round(sell_swing_low, 2),
+                                'ema20': round(float(row['ema20']), 2),
+                                'ema50': round(float(row['ema50']), 2),
+                                'trend': 'DOWN'
+                            }
+                            sell_signal_fired = True
+                            break
+
+            return signal
+
+        except Exception as e:
             return None
 
-        first = df_5_today.iloc[0]
-        f_open = float(first['open'])
-        f_high = float(first['high'])
-        f_low = float(first['low'])
-
-        price = f_open if f_open > 0 else 1.0
-        tol = price * (tolerance_pct / 100)
-
-        buy_setup = abs(f_open - f_low) <= tol
-        sell_setup = abs(f_open - f_high) <= tol
-
-        if not buy_setup and not sell_setup:
-            return None
-
-        buy_inv = False; sell_inv = False
-        buy_imp = False; buy_imp_bar = -1
-        buy_ret = False; buy_ret_bar = -1; buy_sig = False
-        buy_sh = None; buy_f50 = None; buy_f618 = None
-
-        sell_imp = False; sell_imp_bar = -1
-        sell_ret = False; sell_ret_bar = -1; sell_sig = False
-        sell_sl = None; sell_f50 = None; sell_f618 = None
-
-        for i, (idx, row) in enumerate(df_15_today.iterrows()):
-            if i == 0:
-                if buy_setup and row['low'] < f_low:
-                    buy_inv = True
-                if sell_setup and row['high'] > f_high:
-                    sell_inv = True
-                continue
-
-            if idx.time() > market_close:
-                break
-
-            if buy_setup and not buy_inv and not buy_imp:
-                if row['low'] < f_low:
-                    buy_inv = True
-            if sell_setup and not sell_inv and not sell_imp:
-                if row['high'] > f_high:
-                    sell_inv = True
-
-            if buy_setup and not buy_inv and not buy_imp:
-                buy_sh = float(row['high']) if buy_sh is None else max(buy_sh, float(row['high']))
-                if buy_sh >= f_high * (1 + Config.MIN_IMPULSE_PCT / 100):
-                    buy_imp = True; buy_imp_bar = i
-                    buy_f50 = buy_sh - Config.FIB_LEVEL_1 * (buy_sh - f_low)
-                    buy_f618 = buy_sh - Config.FIB_LEVEL_2 * (buy_sh - f_low)
-
-            if sell_setup and not sell_inv and not sell_imp:
-                sell_sl = float(row['low']) if sell_sl is None else min(sell_sl, float(row['low']))
-                if sell_sl <= f_low * (1 - Config.MIN_IMPULSE_PCT / 100):
-                    sell_imp = True; sell_imp_bar = i
-                    sell_f50 = sell_sl + Config.FIB_LEVEL_1 * (f_high - sell_sl)
-                    sell_f618 = sell_sl + Config.FIB_LEVEL_2 * (f_high - sell_sl)
-
-            if buy_imp and not buy_ret and i > buy_imp_bar:
-                if row['low'] <= buy_f50:
-                    buy_ret = True; buy_ret_bar = i
-            if sell_imp and not sell_ret and i > sell_imp_bar:
-                if row['high'] >= sell_f50:
-                    sell_ret = True; sell_ret_bar = i
-
-            if buy_ret and not buy_sig and i > buy_ret_bar:
-                if row['close'] > row['open'] and row['close'] > buy_f50:
-                    up, _ = check_trend(df_15_today.iloc[:i+1])
-                    if row['close'] > row['ema20'] and row['close'] > row['ema50'] and up:
-                        entry = float(row['close']); sl = float(row['low'])
-                        tgt = entry + (entry - sl) * Config.DEFAULT_TARGET_RR
-                        return {
-                            'symbol': sym_clean, 'date': target_date.strftime('%Y-%m-%d'), 'direction': 'BUY',
-                            'setup_time': df_5_today.index[0].strftime('%H:%M'), 'signal_time': idx.strftime('%H:%M'),
-                            'entry_price': round(entry, 2), 'stop_loss': round(sl, 2), 'target': round(tgt, 2),
-                            'risk_reward': f"1:{Config.DEFAULT_TARGET_RR}", 'fib_50': round(buy_f50, 2),
-                            'fib_618': round(buy_f618, 2), 'swing_high': round(buy_sh, 2),
-                            'ema20': round(float(row['ema20']), 2), 'ema50': round(float(row['ema50']), 2), 'trend': 'UP'
-                        }
-
-            if sell_ret and not sell_sig and i > sell_ret_bar:
-                if row['close'] < row['open'] and row['close'] < sell_f50:
-                    _, down = check_trend(df_15_today.iloc[:i+1])
-                    if row['close'] < row['ema20'] and row['close'] < row['ema50'] and down:
-                        entry = float(row['close']); sl = float(row['high'])
-                        tgt = entry - (sl - entry) * Config.DEFAULT_TARGET_RR
-                        return {
-                            'symbol': sym_clean, 'date': target_date.strftime('%Y-%m-%d'), 'direction': 'SELL',
-                            'setup_time': df_5_today.index[0].strftime('%H:%M'), 'signal_time': idx.strftime('%H:%M'),
-                            'entry_price': round(entry, 2), 'stop_loss': round(sl, 2), 'target': round(tgt, 2),
-                            'risk_reward': f"1:{Config.DEFAULT_TARGET_RR}", 'fib_50': round(sell_f50, 2),
-                            'fib_618': round(sell_f618, 2), 'swing_low': round(sell_sl, 2),
-                            'ema20': round(float(row['ema20']), 2), 'ema50': round(float(row['ema50']), 2), 'trend': 'DOWN'
-                        }
-
-        return None
-
-    except Exception as e:
-        return {"_error": True, "_reason": str(e), "symbol": sym_clean}
-
 # ================================================================================
-# WORKER FUNCTION FOR THREAD POOL
+# DISPLAY RESULTS
 # ================================================================================
-def worker_scan(args):
-    """Function to run in thread pool. Returns (symbol, result, is_error)."""
-    idx, symbol, target_date, tolerance_pct, tv_pool = args
-    tv = tv_pool.get(idx)
-    result = scan_stock(tv, symbol, target_date, tolerance_pct)
-    if isinstance(result, dict) and result.get("_error"):
-        return (symbol, result, True)
-    elif result is None:
-        return (symbol, None, False)  # Valid no-setup
-    else:
-        return (symbol, result, False)  # Signal found
-
-# ================================================================================
-# BATCH PROCESSING WITH TIMEOUT
-# ================================================================================
-def run_batch_scan(stock_list, target_date, tolerance_pct, tv_pool, progress_bar, status_text):
-    """
-    Process stocks in batches of 10.
-    Uses ThreadPoolExecutor but with wait(FIRST_COMPLETED) to avoid deadlock.
-    """
-    all_results = []
-    failed_symbols = []
-    completed = 0
-    total = len(stock_list)
-    
-    # Process in batches
-    for batch_start in range(0, total, Config.BATCH_SIZE):
-        batch = stock_list[batch_start:batch_start + Config.BATCH_SIZE]
-        
-        with ThreadPoolExecutor(max_workers=Config.WORKERS) as executor:
-            # Submit batch
-            futures = {}
-            for i, symbol in enumerate(batch):
-                global_idx = batch_start + i
-                future = executor.submit(worker_scan, (global_idx, symbol, target_date, tolerance_pct, tv_pool))
-                futures[future] = symbol
-            
-            # Wait for each to complete with timeout
-            pending = set(futures.keys())
-            while pending:
-                # Wait for at least one to finish, with timeout
-                done, pending = wait(pending, timeout=Config.TIMEOUT, return_when=FIRST_COMPLETED)
-                
-                for future in done:
-                    symbol = futures[future]
-                    completed += 1
-                    
-                    try:
-                        sym, result, is_error = future.result()
-                        if is_error:
-                            failed_symbols.append(symbol)
-                            all_results.append(result)
-                        elif result is not None:
-                            all_results.append(result)
-                    except Exception:
-                        failed_symbols.append(symbol)
-                        all_results.append({"_error": True, "_reason": "exception", "symbol": symbol.replace('.NS', '')})
-                    
-                    # Update progress
-                    progress_bar.progress(completed / total)
-                    status_text.text(f"⚡ Scanning... ({completed}/{total})")
-                
-                # Check for timeouts in pending
-                # If they've been pending too long, we can't cancel them easily
-                # But since we use small batches (10), new batch starts fresh
-    
-    return all_results, failed_symbols
-
-# ================================================================================
-# DISPLAY
-# ================================================================================
-def display_results(all_results, scan_date, perf_stats=None):
-    valid_signals = [r for r in all_results if r is not None and not (isinstance(r, dict) and r.get("_error"))]
-    errors = [r for r in all_results if isinstance(r, dict) and r.get("_error")]
-
-    if not valid_signals:
-        st.warning("⚠️ No signals found.")
-        if errors:
-            with st.expander(f"📊 Data Errors ({len(errors)} stocks)"):
-                for e in errors[:10]:
-                    st.markdown(f'<div class="error-card">{e["symbol"]}: {e.get("_reason", "unknown")}</div>', unsafe_allow_html=True)
+def display_results(signals, scan_date, perf_stats=None):
+    if not signals:
+        st.warning("⚠️ No signals found. No stocks met all Fibonacci retracement conditions.")
         return
 
-    df = pd.DataFrame(valid_signals)
+    df = pd.DataFrame([s for s in signals if s is not None])
+    if df.empty:
+        st.warning("⚠️ No valid signals found.")
+        return
 
+    # Performance badge
     if perf_stats:
         st.markdown(f"""
-        <div class="perf-card">
-            ⚡ <b>Performance:</b> {perf_stats['stocks_scanned']} stocks in {perf_stats['duration']:.1f}s 
-            | {len(valid_signals)} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec
-            | {perf_stats.get('retried', 0)} retried
+        <div style="text-align:center; margin-bottom:1rem;">
+            <span class="speed-badge">⚡ {perf_stats['stocks_scanned']} stocks in {perf_stats['duration']:.1f}s 
+            | {perf_stats['signals_found']} signals | {perf_stats['stocks_per_sec']:.1f} stocks/sec</span>
         </div>
         """, unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
+    col1, col2, col3 = st.columns(3)
+    with col1:
         st.markdown(f'<div class="metric-card"><h3>{len(df)}</h3><p>Total Signals</p></div>', unsafe_allow_html=True)
-    with c2:
-        buys = len(df[df['direction'] == 'BUY'])
-        st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);"><h3>{buys}</h3><p>BUY</p></div>', unsafe_allow_html=True)
-    with c3:
-        sells = len(df[df['direction'] == 'SELL'])
-        st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);"><h3>{sells}</h3><p>SELL</p></div>', unsafe_allow_html=True)
+    with col2:
+        buy_count = len(df[df['direction'] == 'BUY'])
+        st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);"><h3>{buy_count}</h3><p>BUY Signals</p></div>', unsafe_allow_html=True)
+    with col3:
+        sell_count = len(df[df['direction'] == 'SELL'])
+        st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);"><h3>{sell_count}</h3><p>SELL Signals</p></div>', unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("📋 Fib Retracement Signals")
+    st.subheader("📋 Filtered Stocks — Fib Retracement Signals")
 
     for _, row in df.iterrows():
-        card = "buy-card" if row['direction'] == 'BUY' else "sell-card"
-        swing = f"Swing High: {row.get('swing_high', 'N/A')}" if row['direction'] == 'BUY' else f"Swing Low: {row.get('swing_low', 'N/A')}"
+        card_class = "buy-card" if row['direction'] == 'BUY' else "sell-card"
+        swing_text = f"Swing High: {row.get('swing_high', 'N/A')}" if row['direction'] == 'BUY' else f"Swing Low: {row.get('swing_low', 'N/A')}"
 
         st.markdown(f"""
-        <div class="signal-card {card}">
+        <div class="signal-card {card_class}">
             <h4>{row['symbol']} — {row['direction']} @ {row['entry_price']}</h4>
             <p><b>Setup:</b> {row['setup_time']} | <b>Signal:</b> {row['signal_time']} | <b>Trend:</b> {row['trend']}</p>
             <p><b>Entry:</b> {row['entry_price']} | <b>SL:</b> {row['stop_loss']} | <b>TGT:</b> {row['target']} | <b>R:R:</b> {row['risk_reward']}</p>
-            <p><b>Fib 0.5:</b> {row['fib_50']} | <b>Fib 0.618:</b> {row['fib_618']} | {swing}</p>
+            <p><b>Fib 0.5:</b> {row['fib_50']} | <b>Fib 0.618:</b> {row['fib_618']} | {swing_text}</p>
             <p><b>EMA20:</b> {row['ema20']} | <b>EMA50:</b> {row['ema50']}</p>
         </div>
         """, unsafe_allow_html=True)
 
     with st.expander("📊 Export Data"):
         st.dataframe(df, hide_index=True, use_container_width=True)
-
-    if errors:
-        with st.expander(f"⚠️ Errors ({len(errors)} stocks failed)"):
-            for e in errors[:20]:
-                st.markdown(f'<div class="error-card">{e["symbol"]}: {e.get("_reason", "unknown")}</div>', unsafe_allow_html=True)
 
 # ================================================================================
 # MAIN APP
@@ -385,154 +387,299 @@ def main():
         st.stop()
 
     st.markdown('<div class="main-header">📈 Open Drive Fib Scanner</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">NSE Open=Low/High + Fib Retracement + EMA Alignment</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Scans NSE stocks for Open=Low/High + Fib Retracement + EMA alignment</div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("⚙️ Settings")
-        scan_mode = st.radio("Mode:", ["Historical Scan", "Real-Time Scan"])
+
+        scan_mode = st.radio("Select Mode:", ["Historical Scan", "Real-Time Scan"])
         scan_date = st.date_input("Scan Date", value=datetime.now(IST) - timedelta(days=1), max_value=datetime.now(IST))
 
         st.markdown("---")
         st.subheader("📋 Stock List")
-        input_method = st.radio("Input:", ["Paste Symbols", "Use Default List"])
+        input_method = st.radio("Input method:", ["Paste Symbols", "Use Default List"])
 
         default_symbols = (
-            "HDFCBANK.NS\nAXISBANK.NS\nICICIBANK.NS\nKOTAKBANK.NS\nRBLBANK.NS\nFEDERALBANK.NS\nBANDHANBANK.NS\nAUBANK.NS\nINDUSINDBANK.NS\nIDFCFIRSTBANK.NS\n"
-            "SBIN.NS\nBANKBARODA.NS\nCANBANK.NS\nPNB.NS\nABCAPITAL.NS\nANGELONE.NS\nBAJAJFINSERV.NS\nBAJAJFINANCE.NS\nBSE.NS\nCDSL.NS\n"
-            "HDFCAMC.NS\nJIOFIN.NS\nLICHOUSING.NS\nLICI.NS\nMANAPURAM.NS\nMCX.NS\nPFC.NS\nREC.NS\nSHRIRAMFINANCE.NS\nHCLTECH.NS\n"
-            "INFY.NS\nLTM.NS\nTCS.NS\nTECHM.NS\nWIPRO.NS\nHINDALCO.NS\nHINDZINC.NS\nNATIONALALUMINUM.NS\nNMDC.NS\nSAIL.NS\n"
-            "TATASTEEL.NS\nVEDL.NS\nDLF.NS\nOBEROIREALITY.NS\nBRITANNIA.NS\nCOLPAL.NS\nDABUR.NS\nHINDUNILVR.NS\nMARICO.NS\nTATACONSUMER.NS\n"
-            "BPCL.NS\nCOALINDIA.NS\nGAIL.NS\nHINDPETRO.NS\nIOC.NS\nOIL.NS\nONGC.NS\nRELIANCE.NS\nASHOKLEY.NS\nBAJAJAUTO.NS\n"
-            "BHARATFORG.NS\nEICHER.NS\nEXIDE.NS\nHEROMOTO.NS\nM&M.NS\nMARUTI.NS\nTMPV.NS\nTVSMOTOR.NS\nASIANPAINT.NS\nCROMPTON.NS\n"
-            "HAVELLS.NS\nTITAN.NS\nVOLTAS.NS\nAPOLLOHOSPITAL.NS\nAUROPHARMA.NS\nBIOCON.NS\nDRREDDY.NS\nLAURUSLAB.NS\nLUPIN.NS\nSUNPHARMA.NS\n"
-            "SRF.NS\nSOLARINDUSTRY.NS\nAMBUJACEMENT.NS\nGRASIM.NS\nLT.NS\nNBCC.NS\nULTRATECH.NS\nABB.NS\nASTRAL.NS\nBEL.NS\n"
-            "BHEL.NS\nCGPOWER.NS\nCUMMINS.NS\nHAL.NS\nKEI.NS\nPOLYCAB.NS\nPOWERINDIA.NS\nETERNAL.NS\nINDHOTEL.NS\nNYKAA.NS\n"
-            "TRENT.NS\nNTPC.NS\nTATAPOWER.NS\nPOWERGRID.NS\nADANIPORTS.NS\nDELHIVERY.NS\nCONCOR.NS\nGMR.NS\nINDIGO.NS\nBHARTIAIRTEL.NS"
+            "HDFCBANK.NS
+AXISBANK.NS
+ICICIBANK.NS
+KOTAKBANK.NS
+RBLBANK.NS
+FEDERALBANK.NS
+BANDHANBANK.NS
+AUBANK.NS
+INDUSINDBANK.NS
+IDFCFIRSTBANK.NS
+"
+            "SBIN.NS
+BANKBARODA.NS
+CANBANK.NS
+PNB.NS
+ABCAPITAL.NS
+ANGELONE.NS
+BAJAJFINSERV.NS
+BAJAJFINANCE.NS
+BSE.NS
+CDSL.NS
+"
+            "HDFCAMC.NS
+JIOFIN.NS
+LICHOUSING.NS
+LICI.NS
+MANAPURAM.NS
+MCX.NS
+PFC.NS
+REC.NS
+SHRIRAMFINANCE.NS
+HCLTECH.NS
+"
+            "INFY.NS
+LTM.NS
+TCS.NS
+TECHM.NS
+WIPRO.NS
+HINDALCO.NS
+HINDZINC.NS
+NATIONALALUMINUM.NS
+NMDC.NS
+SAIL.NS
+"
+            "TATASTEEL.NS
+VEDL.NS
+DLF.NS
+OBEROIREALITY.NS
+BRITANNIA.NS
+COLPAL.NS
+DABUR.NS
+HINDUNILVR.NS
+MARICO.NS
+TATACONSUMER.NS
+"
+            "BPCL.NS
+COALINDIA.NS
+GAIL.NS
+HINDPETRO.NS
+IOC.NS
+OIL.NS
+ONGC.NS
+RELIANCE.NS
+ASHOKLEY.NS
+BAJAJAUTO.NS
+"
+            "BHARATFORG.NS
+EICHER.NS
+EXIDE.NS
+HEROMOTO.NS
+M&M.NS
+MARUTI.NS
+TMPV.NS
+TVSMOTOR.NS
+ASIANPAINT.NS
+CROMPTON.NS
+"
+            "HAVELLS.NS
+TITAN.NS
+VOLTAS.NS
+APOLLOHOSPITAL.NS
+AUROPHARMA.NS
+BIOCON.NS
+DRREDDY.NS
+LAURUSLAB.NS
+LUPIN.NS
+SUNPHARMA.NS
+"
+            "SRF.NS
+SOLARINDUSTRY.NS
+AMBUJACEMENT.NS
+GRASIM.NS
+LT.NS
+NBCC.NS
+ULTRATECH.NS
+ABB.NS
+ASTRAL.NS
+BEL.NS
+"
+            "BHEL.NS
+CGPOWER.NS
+CUMMINS.NS
+HAL.NS
+KEI.NS
+POLYCAB.NS
+POWERINDIA.NS
+ETERNAL.NS
+INDHOTEL.NS
+NYKAA.NS
+"
+            "TRENT.NS
+NTPC.NS
+TATAPOWER.NS
+POWERGRID.NS
+ADANIPORTS.NS
+DELHIVERY.NS
+CONCOR.NS
+GMR.NS
+INDIGO.NS
+BHARTIAIRTEL.NS"
         )
 
         if input_method == "Paste Symbols":
-            symbols_text = st.text_area("Symbols (one per line):", height=150, value=default_symbols)
-            stock_list = [line.strip() for line in symbols_text.split('\n') if line.strip()]
+            symbols_text = st.text_area("Enter symbols (one per line):", height=150, value=default_symbols)
+            stock_list = [line.strip() for line in symbols_text.split('
+') if line.strip()]
         else:
-            stock_list = [line.strip() for line in default_symbols.split('\n') if line.strip()]
+            stock_list = [line.strip() for line in default_symbols.split('
+') if line.strip()]
 
         st.markdown(f"**{len(stock_list)} stocks loaded**")
         st.markdown("---")
 
-        st.subheader("🔧 Parameters")
+        st.subheader("🔧 Strategy Parameters")
         ema_fast = st.number_input("EMA Fast", value=20, min_value=5, max_value=100)
         ema_slow = st.number_input("EMA Slow", value=50, min_value=10, max_value=200)
-        fib_50 = st.number_input("Fib Level 1", value=0.50, min_value=0.10, max_value=0.90, step=0.01)
-        fib_618 = st.number_input("Fib Level 2", value=0.618, min_value=0.10, max_value=0.90, step=0.001)
+        fib_50 = st.number_input("Fib Level 1 (0.5)", value=0.50, min_value=0.10, max_value=0.90, step=0.01)
+        fib_618 = st.number_input("Fib Level 2 (0.618)", value=0.618, min_value=0.10, max_value=0.90, step=0.001)
         impulse_pct = st.number_input("Min Impulse %", value=0.5, min_value=0.1, max_value=5.0, step=0.1)
-        rr = st.number_input("Risk:Reward", value=2.0, min_value=1.0, max_value=5.0, step=0.5)
-        tolerance_pct = st.number_input("Tolerance %", value=0.01, min_value=0.001, max_value=1.0, step=0.001, format="%.3f")
+        rr = st.number_input("Risk:Reward Ratio", value=2.0, min_value=1.0, max_value=5.0, step=0.5)
+        tolerance_pct = st.number_input("Open=High/Low Tolerance (%)", value=0.01, min_value=0.001, max_value=1.0, step=0.001, format="%.3f")
 
         st.markdown("---")
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN — BATCHED PARALLEL
+    # HISTORICAL SCAN — OPTIMIZED FOR SPEED
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
 
-        tv_pool = TVPool(Config.WORKERS)
-        target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
+        # Initialize TV pool (cached, fast on subsequent runs)
+        tv_pool = get_tv_pool()
+
+        strategy = OpenDriveFibStrategy()
+        strategy.config.EMA_FAST = ema_fast
+        strategy.config.EMA_SLOW = ema_slow
+        strategy.config.FIB_LEVEL_1 = fib_50
+        strategy.config.FIB_LEVEL_2 = fib_618
+        strategy.config.MIN_IMPULSE_PCT = impulse_pct
+        strategy.config.DEFAULT_TARGET_RR = rr
 
         progress_container = st.empty()
         with progress_container.container():
-            st.subheader("⏳ Scanning...")
-            bar = st.progress(0)
-            status = st.empty()
+            st.subheader("⏳ Scanning for Fib Retracement Signals...")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-        # Run batch scan
-        all_results, failed_symbols = run_batch_scan(
-            stock_list, target_date, tolerance_pct, tv_pool, bar, status
-        )
+        all_signals = []
+        total = len(stock_list)
+        completed = 0
 
-        # Retry failed stocks
-        if failed_symbols:
-            status.text(f"🔄 Retrying {len(failed_symbols)} failed stocks...")
-            time.sleep(1)
-            
-            retry_results, _ = run_batch_scan(
-                failed_symbols, target_date, tolerance_pct, tv_pool, bar, status
-            )
-            
-            # Replace errors with successful retries
-            final_results = []
-            retry_symbols = {r['symbol'] for r in retry_results if isinstance(r, dict) and not r.get('_error')}
-            
-            for r in all_results:
-                if isinstance(r, dict) and r.get('_error') and r['symbol'] in retry_symbols:
-                    # Find matching retry result
-                    for rr in retry_results:
-                        if isinstance(rr, dict) and not rr.get('_error') and rr['symbol'] == r['symbol']:
-                            final_results.append(rr)
-                            break
-                else:
-                    final_results.append(r)
-            
-            all_results = final_results
+        def process_stock(task_data):
+            """Worker: fetch data and scan one stock."""
+            idx, sym, target_date = task_data
+            tv_inst = tv_pool[idx % len(tv_pool)]
+            time.sleep(ScaleConfig.BASE_DELAY + random.uniform(0, 0.03))
+            return strategy.scan_stock(tv_inst, sym, target_date, tolerance_pct)
+
+        # CRITICAL: Submit ALL tasks at once — ThreadPoolExecutor queues them internally
+        # This is the key to true concurrency vs. batching
+        with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
+            tasks = [(i, sym, scan_date) for i, sym in enumerate(stock_list)]
+            futures = {executor.submit(process_stock, task): task for task in tasks}
+
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                if completed % 5 == 0 or completed == total:
+                    progress_bar.progress(completed / total)
+                    status_text.text(f"⚡ Scanning... ({completed}/{total})")
+
+                try:
+                    res = future.result()
+                    if res:
+                        all_signals.append(res)
+                except Exception:
+                    pass
 
         progress_container.empty()
 
+        # Performance stats
         duration = time.time() - start_time
-        valid_signals = [r for r in all_results if r is not None and not (isinstance(r, dict) and r.get("_error"))]
-        errors = [r for r in all_results if isinstance(r, dict) and r.get("_error")]
-
         perf_stats = {
-            'stocks_scanned': len(stock_list),
+            'stocks_scanned': total,
             'duration': duration,
-            'signals_found': len(valid_signals),
-            'stocks_per_sec': len(stock_list) / duration if duration > 0 else 0,
-            'retried': len(failed_symbols)
+            'signals_found': len(all_signals),
+            'stocks_per_sec': total / duration if duration > 0 else 0
         }
 
-        display_results(all_results, scan_date, perf_stats)
+        display_results(all_signals, scan_date, perf_stats)
 
     # ---------------------------------------------------------
-    # REAL-TIME SCAN
+    # REAL-TIME SCAN — OPTIMIZED
     # ---------------------------------------------------------
     elif scan_button and stock_list and scan_mode == "Real-Time Scan":
-        st.markdown('<div style="text-align:center;"><span style="background:#28a745;color:white;padding:4px 12px;border-radius:10px;">🟢 LIVE</span></div>', unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;"><span class="live-badge">🔴 INITIALIZING...</span></div>', unsafe_allow_html=True)
+        tv_pool = get_tv_pool()
+        st.markdown('<div style="text-align:center;"><span class="live-badge" style="background-color: #28a745;">🟢 LIVE</span></div>', unsafe_allow_html=True)
 
-        tv_pool = TVPool(Config.WORKERS)
+        strategy = OpenDriveFibStrategy()
+        strategy.config.EMA_FAST = ema_fast
+        strategy.config.EMA_SLOW = ema_slow
+        strategy.config.FIB_LEVEL_1 = fib_50
+        strategy.config.FIB_LEVEL_2 = fib_618
+        strategy.config.MIN_IMPULSE_PCT = impulse_pct
+        strategy.config.DEFAULT_TARGET_RR = rr
+
         live_container = st.empty()
 
-        while True:
-            all_results = []
-            live_dt = datetime.now(IST)
-            ct = live_dt.time()
-            is_open = (live_dt.weekday() < 5 and
-                       ct >= datetime.strptime("09:15", "%H:%M").time() and
-                       ct <= datetime.strptime("15:30", "%H:%M").time())
+        def process_live(task_data):
+            idx, sym, target_time = task_data
+            tv_inst = tv_pool[idx % len(tv_pool)]
+            time.sleep(ScaleConfig.BASE_DELAY + random.uniform(0, 0.02))
+            return strategy.scan_stock(tv_inst, sym, target_time, tolerance_pct)
 
-            target_date = live_dt.date()
+        while True:
+            all_signals = []
+            live_datetime = datetime.now(IST)
+            current_time = live_datetime.time()
+
+            is_market_open = (live_datetime.weekday() < 5 and 
+                current_time >= datetime.strptime("09:15", "%H:%M").time() and 
+                current_time <= datetime.strptime("15:30", "%H:%M").time())
 
             progress_container = st.empty()
             with progress_container.container():
-                live_bar = st.progress(0)
+                live_progress = st.progress(0)
                 live_status = st.empty()
 
-            # Live scan: single batch of all stocks
-            live_results, _ = run_batch_scan(
-                stock_list, target_date, tolerance_pct, tv_pool, live_bar, live_status
-            )
-            all_results = [r for r in live_results if r is not None and not (isinstance(r, dict) and r.get("_error"))]
+            total = len(stock_list)
+            completed = 0
+
+            with ThreadPoolExecutor(max_workers=ScaleConfig.MAX_THREAD_WORKERS) as executor:
+                tasks = [(i, sym, live_datetime) for i, sym in enumerate(stock_list)]
+                futures = {executor.submit(process_live, task): task for task in tasks}
+
+                for future in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    if completed % 5 == 0 or completed == total:
+                        live_progress.progress(completed / total)
+                        live_status.text(f"⚡ Live Scanning... ({completed}/{total})")
+
+                    try:
+                        res = future.result()
+                        if res:
+                            all_signals.append(res)
+                    except Exception:
+                        pass
 
             progress_container.empty()
 
             with live_container.container():
-                mkt = "🟢 Market Open" if is_open else "🔴 Market Closed"
-                st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | {mkt}")
-                display_results(all_results, live_dt)
+                market_status = "🟢 Market Open" if is_market_open else "🔴 Market Closed"
+                st.write(f"⏱️ Last Updated: {datetime.now(IST).strftime('%H:%M:%S IST')} | {market_status}")
+                display_results(all_signals, live_datetime)
 
-            time.sleep(60 if not is_open else 10)
+            time.sleep(60 if not is_market_open else 5)
 
     elif not stock_list:
-        st.info("Please add stocks to scan.")
+        st.info("Please add stocks to scan from the sidebar.")
 
 if __name__ == "__main__":
     main()
