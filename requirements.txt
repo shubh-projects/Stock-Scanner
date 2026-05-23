@@ -1,3 +1,5 @@
 streamlit
 pandas
 tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
+numpy
+aiohttp
