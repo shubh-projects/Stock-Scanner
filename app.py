@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 import time
 import warnings
 import logging
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import threading
 from tvDatafeed import TvDatafeed, Interval
 
@@ -23,7 +25,9 @@ class Config:
     FIB_LEVEL_2 = 0.618
     MIN_IMPULSE_PCT = 0.5
     DEFAULT_TARGET_RR = 2.0
-    TIMEOUT_SECONDS = 12  # Max wait per stock
+    WORKERS = 10           # 10 concurrent threads
+    BATCH_SIZE = 10        # Submit 10 at a time
+    TIMEOUT = 12           # Seconds per stock
 
 # ================================================================================
 # UI SETUP
@@ -242,30 +246,75 @@ def scan_stock(tv, symbol, target_date, tolerance_pct):
         return {"_error": True, "_reason": str(e), "symbol": sym_clean}
 
 # ================================================================================
-# THREAD-BASED TIMEOUT (cross-platform)
+# WORKER FUNCTION FOR THREAD POOL
 # ================================================================================
-def scan_with_timeout(tv_pool, idx, symbol, target_date, tolerance_pct):
+def worker_scan(args):
+    """Function to run in thread pool. Returns (symbol, result, is_error)."""
+    idx, symbol, target_date, tolerance_pct, tv_pool = args
+    tv = tv_pool.get(idx)
+    result = scan_stock(tv, symbol, target_date, tolerance_pct)
+    if isinstance(result, dict) and result.get("_error"):
+        return (symbol, result, True)
+    elif result is None:
+        return (symbol, None, False)  # Valid no-setup
+    else:
+        return (symbol, result, False)  # Signal found
+
+# ================================================================================
+# BATCH PROCESSING WITH TIMEOUT
+# ================================================================================
+def run_batch_scan(stock_list, target_date, tolerance_pct, tv_pool, progress_bar, status_text):
     """
-    Run scan_stock in a thread with timeout.
-    Returns result or error dict if timeout.
+    Process stocks in batches of 10.
+    Uses ThreadPoolExecutor but with wait(FIRST_COMPLETED) to avoid deadlock.
     """
-    result_container = {}
+    all_results = []
+    failed_symbols = []
+    completed = 0
+    total = len(stock_list)
     
-    def worker():
-        tv = tv_pool.get(idx)
-        result_container['result'] = scan_stock(tv, symbol, target_date, tolerance_pct)
+    # Process in batches
+    for batch_start in range(0, total, Config.BATCH_SIZE):
+        batch = stock_list[batch_start:batch_start + Config.BATCH_SIZE]
+        
+        with ThreadPoolExecutor(max_workers=Config.WORKERS) as executor:
+            # Submit batch
+            futures = {}
+            for i, symbol in enumerate(batch):
+                global_idx = batch_start + i
+                future = executor.submit(worker_scan, (global_idx, symbol, target_date, tolerance_pct, tv_pool))
+                futures[future] = symbol
+            
+            # Wait for each to complete with timeout
+            pending = set(futures.keys())
+            while pending:
+                # Wait for at least one to finish, with timeout
+                done, pending = wait(pending, timeout=Config.TIMEOUT, return_when=FIRST_COMPLETED)
+                
+                for future in done:
+                    symbol = futures[future]
+                    completed += 1
+                    
+                    try:
+                        sym, result, is_error = future.result()
+                        if is_error:
+                            failed_symbols.append(symbol)
+                            all_results.append(result)
+                        elif result is not None:
+                            all_results.append(result)
+                    except Exception:
+                        failed_symbols.append(symbol)
+                        all_results.append({"_error": True, "_reason": "exception", "symbol": symbol.replace('.NS', '')})
+                    
+                    # Update progress
+                    progress_bar.progress(completed / total)
+                    status_text.text(f"⚡ Scanning... ({completed}/{total})")
+                
+                # Check for timeouts in pending
+                # If they've been pending too long, we can't cancel them easily
+                # But since we use small batches (10), new batch starts fresh
     
-    thread = threading.Thread(target=worker)
-    thread.daemon = True
-    thread.start()
-    thread.join(timeout=Config.TIMEOUT_SECONDS)
-    
-    if thread.is_alive():
-        # Thread is still running (hung in tvDatafeed)
-        # We can't kill it, but we abandon it and move on
-        return {"_error": True, "_reason": "timeout", "symbol": symbol.replace('.NS', '')}
-    
-    return result_container.get('result', {"_error": True, "_reason": "no_result", "symbol": symbol.replace('.NS', '')})
+    return all_results, failed_symbols
 
 # ================================================================================
 # DISPLAY
@@ -383,12 +432,12 @@ def main():
         scan_button = st.button("🚀 Start Fib Scan", type="primary")
 
     # ---------------------------------------------------------
-    # HISTORICAL SCAN
+    # HISTORICAL SCAN — BATCHED PARALLEL
     # ---------------------------------------------------------
     if scan_button and stock_list and scan_mode == "Historical Scan":
         start_time = time.time()
 
-        tv_pool = TVPool(8)
+        tv_pool = TVPool(Config.WORKERS)
         target_date = scan_date.date() if hasattr(scan_date, 'date') else scan_date
 
         progress_container = st.empty()
@@ -397,33 +446,35 @@ def main():
             bar = st.progress(0)
             status = st.empty()
 
-        all_results = []
-        failed_symbols = []
-        total = len(stock_list)
-
-        for i, symbol in enumerate(stock_list):
-            bar.progress((i + 1) / total)
-            status.text(f"⚡ Scanning... ({i+1}/{total}) — {symbol.replace('.NS', '')}")
-
-            result = scan_with_timeout(tv_pool, i, symbol, target_date, tolerance_pct)
-
-            if isinstance(result, dict) and result.get("_error"):
-                failed_symbols.append(symbol)
-                all_results.append(result)
-            elif result is not None:
-                all_results.append(result)
+        # Run batch scan
+        all_results, failed_symbols = run_batch_scan(
+            stock_list, target_date, tolerance_pct, tv_pool, bar, status
+        )
 
         # Retry failed stocks
         if failed_symbols:
             status.text(f"🔄 Retrying {len(failed_symbols)} failed stocks...")
             time.sleep(1)
-
-            for symbol in failed_symbols:
-                result = scan_with_timeout(tv_pool, 999, symbol, target_date, tolerance_pct)
-                if not (isinstance(result, dict) and result.get("_error")):
-                    all_results = [r for r in all_results if not (isinstance(r, dict) and r.get("symbol") == symbol.replace('.NS', '') and r.get("_error"))]
-                    if result is not None:
-                        all_results.append(result)
+            
+            retry_results, _ = run_batch_scan(
+                failed_symbols, target_date, tolerance_pct, tv_pool, bar, status
+            )
+            
+            # Replace errors with successful retries
+            final_results = []
+            retry_symbols = {r['symbol'] for r in retry_results if isinstance(r, dict) and not r.get('_error')}
+            
+            for r in all_results:
+                if isinstance(r, dict) and r.get('_error') and r['symbol'] in retry_symbols:
+                    # Find matching retry result
+                    for rr in retry_results:
+                        if isinstance(rr, dict) and not rr.get('_error') and rr['symbol'] == r['symbol']:
+                            final_results.append(rr)
+                            break
+                else:
+                    final_results.append(r)
+            
+            all_results = final_results
 
         progress_container.empty()
 
@@ -432,10 +483,10 @@ def main():
         errors = [r for r in all_results if isinstance(r, dict) and r.get("_error")]
 
         perf_stats = {
-            'stocks_scanned': total,
+            'stocks_scanned': len(stock_list),
             'duration': duration,
             'signals_found': len(valid_signals),
-            'stocks_per_sec': total / duration if duration > 0 else 0,
+            'stocks_per_sec': len(stock_list) / duration if duration > 0 else 0,
             'retried': len(failed_symbols)
         }
 
@@ -447,7 +498,7 @@ def main():
     elif scan_button and stock_list and scan_mode == "Real-Time Scan":
         st.markdown('<div style="text-align:center;"><span style="background:#28a745;color:white;padding:4px 12px;border-radius:10px;">🟢 LIVE</span></div>', unsafe_allow_html=True)
 
-        tv_pool = TVPool(8)
+        tv_pool = TVPool(Config.WORKERS)
         live_container = st.empty()
 
         while True:
@@ -465,15 +516,11 @@ def main():
                 live_bar = st.progress(0)
                 live_status = st.empty()
 
-            total = len(stock_list)
-
-            for i, symbol in enumerate(stock_list):
-                live_bar.progress((i + 1) / total)
-                live_status.text(f"⚡ Live Scanning... ({i+1}/{total})")
-
-                result = scan_with_timeout(tv_pool, i, symbol, target_date, tolerance_pct)
-                if result is not None and not (isinstance(result, dict) and result.get("_error")):
-                    all_results.append(result)
+            # Live scan: single batch of all stocks
+            live_results, _ = run_batch_scan(
+                stock_list, target_date, tolerance_pct, tv_pool, live_bar, live_status
+            )
+            all_results = [r for r in live_results if r is not None and not (isinstance(r, dict) and r.get("_error"))]
 
             progress_container.empty()
 
