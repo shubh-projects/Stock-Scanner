@@ -398,8 +398,8 @@ def main():
         st.markdown("---")
         st.subheader("📋 Stock List")
         input_method = st.radio("Input method:", ["Paste Symbols", "Use Default List"])
-
-                default_symbols = """
+        
+        default_symbols = """
 HDFCBANK.NS
 AXISBANK.NS
 ICICIBANK.NS
